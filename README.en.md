@@ -5,7 +5,7 @@
 > **Stilla is an independent community project. It is not created, endorsed, or officially supported by Anthropic.**
 > "Claude" is a trademark of Anthropic, PBC; it is used here only to say what the tool works with.
 
-[中文](README.md)  ·  The UI is currently Chinese only.
+[中文](README.md)  ·  The UI comes in Chinese and English; this page describes the **English edition** (its source is in [en/](en/); the repository root holds the Chinese edition).
 
 ![Stilla](docs/screenshots/hero.png)
 
@@ -46,17 +46,17 @@ The quota conversion is an estimate with an error of around 5%: use it to judge 
 
 Windows 10 / 11 only (uses the .NET Framework 4 that ships with Windows).
 
-1. Download `Stilla-Setup-0.1.0-zh.exe` from [Releases](../../releases) and run it (no admin rights needed; the UI is Chinese only for now). Prefer no installer? Download `Stilla-0.1.0-portable-zh.zip` and unzip it.
+1. Download `Stilla-Setup-0.1.1-en.exe` (English UI) from [Releases](../../releases) and run it (no admin rights needed; it installs to `%LOCALAPPDATA%\Programs\Stilla`). Prefer no installer? Download `Stilla-0.1.1-portable-en.zip` and unzip it. The Chinese-UI edition is the same program with `-zh` in the file name; both editions install to the same place, so only one can be installed at a time.
 2. Tick **"Configure the Claude Code status line"**. This edits `~/.claude/settings.json`: it makes a backup first, keeps any status line you already have (it chains to it), and is undone on uninstall. You can also do it later from the widget's right-click menu.
 3. Restart Claude Code and send a message.
 
 > **About the "unknown publisher" warning.** The installer is **not code-signed** (this is a personal project without a paid signing certificate), so Windows SmartScreen may show "Windows protected your PC" (click **More info → Run anyway**), and a few antivirus programs may flag it. To check that your download is what was published:
 >
 > ```powershell
-> certutil -hashfile Stilla-Setup-0.1.0-zh.exe SHA256
+> certutil -hashfile Stilla-Setup-0.1.1-en.exe SHA256
 > ```
 >
-> The output must match this file's line in `SHA256SUMS-zh.txt` on the Release page. The source is public and has no third-party dependencies, so you can also build it yourself with `powershell -ExecutionPolicy Bypass -File build.ps1` (it only needs the `csc.exe` that ships with Windows).
+> The output must match this file's line in `SHA256SUMS-en.txt` on the Release page. The source is public and has no third-party dependencies, so you can also build it yourself with `powershell -ExecutionPolicy Bypass -File build.ps1` (it only needs the `csc.exe` that ships with Windows); run it inside `en/` for the English edition.
 
 ## Where the numbers come from
 
@@ -78,7 +78,7 @@ With the default Auto mode Stilla does not read the login token unless you agree
 
 Stilla checks GitHub for a newer Release once at each launch (on by default; turn it off in the settings window). When there is one, a small red dot appears next to the Stilla mark; "前往更新页面" opens the Release page. It never downloads or installs anything by itself. It needs to reach `api.github.com`; if it can't, the settings window says the check failed and no dot appears.
 
-## Coming next (not in 0.1.0)
+## Coming next (not in 0.1.1)
 
 These already run on the author's own machine and will be released as soon as time allows (no date promised). Once they are out, everyone who has Stilla installed will see the update dot, so there is no need to search for updates.
 

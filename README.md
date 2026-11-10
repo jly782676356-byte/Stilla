@@ -7,7 +7,7 @@
 
 > *Stilla is an independent community project, not created, endorsed or supported by Anthropic. "Claude" is a trademark of Anthropic, PBC, used here only to say what the tool works with.*
 
-**English:** a tiny always-on-top Windows widget for Claude Code. It shows how much of your 5-hour and weekly limits you have used, when they reset, and where your tokens go (by session / model). The app's UI is currently Chinese only. Full English page: [README.en.md](README.en.md).
+**English:** a tiny always-on-top Windows widget for Claude Code. It shows how much of your 5-hour and weekly limits you have used, when they reset, and where your tokens go (by session / model). The UI comes in Chinese and English (download the `-en` installer). Full English page: [README.en.md](README.en.md); the English edition's source is in [en/](en/).
 
 ![Stilla](docs/screenshots/hero.png)
 
@@ -52,19 +52,19 @@
 
 只支持 **Windows 10 / 11**（用系统自带的 .NET Framework 4，不用另装运行库）。
 
-1. 从 [Releases](../../releases) 下载 `Stilla-Setup-0.1.0-zh.exe`（目前只有中文界面），双击安装（不需要管理员权限，装在 `%LOCALAPPDATA%\Programs\Stilla`）。不想安装的话下载 `Stilla-0.1.0-portable-zh.zip`，解压即用。
+1. 从 [Releases](../../releases) 下载 `Stilla-Setup-0.1.1-zh.exe`（中文界面；想用英文界面就下载 `Stilla-Setup-0.1.1-en.exe`），双击安装（不需要管理员权限，装在 `%LOCALAPPDATA%\Programs\Stilla`）。不想安装的话下载 `Stilla-0.1.1-portable-zh.zip`（英文版是 `-en.zip`），解压即用。两个语言版装在同一个位置，不能同时装。
 2. 安装程序里**勾选「配置 Claude Code 状态栏」**（见下）。会修改 `~/.claude/settings.json`：先备份、保留你已有的状态栏、卸载时撤销。不勾也行，装好后在 Stilla 右键菜单里再设。
 3. 重启 Claude Code，发一条消息，悬浮窗就有数据了。
 
 > **关于"未知发布者"提示**：安装包**没有代码签名**（个人项目，没有买签名证书），所以 Windows SmartScreen 可能提示"Windows 已保护你的电脑"，点「更多信息 → 仍要运行」即可；个别杀毒软件也可能误报。想确认下载的文件和发布的一致，可以核对 SHA-256：
 >
 > ```powershell
-> certutil -hashfile Stilla-Setup-0.1.0-zh.exe SHA256
+> certutil -hashfile Stilla-Setup-0.1.1-zh.exe SHA256
 > ```
 >
-> 输出应与 Release 页里 `SHA256SUMS-zh.txt` 中这个文件的那一行一致。源码全部公开、没有第三方依赖，也可以直接 [从源码构建](#从源码构建)，只需要 Windows 自带的 `csc.exe`。
+> 输出应与 Release 页里 `SHA256SUMS-zh.txt`（英文版是 `SHA256SUMS-en.txt`）中这个文件的那一行一致。源码全部公开、没有第三方依赖，也可以直接 [从源码构建](#从源码构建)，只需要 Windows 自带的 `csc.exe`。
 
-静默安装 / 卸载：`Stilla-Setup-0.1.0-zh.exe /S [/D=安装目录] [/nostatusline] [/desktop] [/autostart] [/nolaunch]`；`Stilla-Setup.exe /uninstall /S [/purge]`。
+静默安装 / 卸载（中英文安装包参数相同）：`Stilla-Setup-0.1.1-zh.exe /S [/D=安装目录] [/nostatusline] [/desktop] [/autostart] [/nolaunch]`；`Stilla-Setup.exe /uninstall /S [/purge]`。
 
 ## 额度数字从哪来
 
@@ -113,7 +113,7 @@ Claude Code 没有公开的"查额度"接口，所以有三种方式，在右键
 - 免联网：设置里取消勾选，或设环境变量 `STILLA_NO_UPDATE_CHECK=1`。
 - 检查更新要能连上 GitHub（`api.github.com`）。连不上时设置窗口会写"检查失败"，这时不会出现小红点，可以自己打开 [Releases](../../releases) 看。
 
-## 下一版预告（尚未包含在 0.1.0）
+## 下一版预告（尚未包含在 0.1.1）
 
 下面这些功能已经在作者自己的电脑上用着，会抽空尽快整理上线，不承诺日期。上线后，已经装了 Stilla 的人会在悬浮窗上看到更新小红点，不用自己去搜更新。
 
@@ -167,7 +167,9 @@ Stilla 免费开源，没有任何付费功能，捐赠完全自愿，也不会�
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-输出在 `dist\`：`Stilla.exe`、`Stilla.Statusline.exe`、`scripts\`、`Stilla-Setup-0.1.0-zh.exe`、`Stilla-0.1.0-portable-zh.zip`。要发 Release 的话，再运行 `tools\make-release.ps1 -OutDir <文件夹>`，会整理好安装包、zip、`SHA256SUMS` 和 Release 说明。源码是 C# 5（系统自带 `csc.exe` 的版本），所以不要用 `?.` 和字符串插值。贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+输出在 `dist\`：`Stilla.exe`、`Stilla.Statusline.exe`、`scripts\`、`Stilla-Setup-0.1.1-zh.exe`、`Stilla-0.1.1-portable-zh.zip`。要发 Release 的话，再运行 `tools\make-release.ps1 -OutDir <文件夹>`，会整理好安装包、zip、`SHA256SUMS` 和 Release 说明。源码是 C# 5（系统自带 `csc.exe` 的版本），所以不要用 `?.` 和字符串插值。贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+**英文界面版**的源码在 [en/](en/)：进到 `en` 目录同样运行 `build.ps1`。`en/` 是用翻译表从本目录的中文版源码生成的（翻译流程暂时没有收进仓库），所以直接改 `en/` 里的文件会在下次重新生成时被覆盖 —— 想改英文文案或修英文版的问题，请开 issue 或 PR，我会同步进翻译表。
 
 **自己 fork 一份来改的话**：运行 `tools\set-repo.ps1 -Owner 你的用户名` 把更新检查 / 捐赠入口指向你自己的仓库，然后重新构建（不改的话，你构建出来的版本会去检查本项目的新版本）。
 
