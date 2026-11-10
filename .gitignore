@@ -1,0 +1,31 @@
+# 构建产物：安装包放 GitHub Releases，不进仓库
+dist/
+*.exe
+*.pdb
+obj/
+bin/
+
+# 渲染测试的输出
+tools/ui-check/out/
+
+# 运行时数据（绝不能提交：里面有会话标题、项目路径、账号信息）
+logs/
+data/
+demo/
+settings.txt
+rate_limits.json
+roots.txt
+statusline-chain-*.txt
+*.csv
+*.stilla-backup-*
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
