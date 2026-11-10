@@ -5,9 +5,29 @@
 > **Stilla 是独立的社区项目，不是 Anthropic 出品，也没有得到 Anthropic 的认可或支持。**
 > "Claude" 是 Anthropic, PBC 的商标，这里只用来说明本工具是给 Claude Code 用的。
 
-[English](README.en.md)
+> *Stilla is an independent community project, not created, endorsed or supported by Anthropic. "Claude" is a trademark of Anthropic, PBC, used here only to say what the tool works with.*
+
+**English:** a tiny always-on-top Windows widget for Claude Code. It shows how much of your 5-hour and weekly limits you have used, when they reset, and where your tokens go (by session / model). The app's UI is currently Chinese only. Full English page: [README.en.md](README.en.md).
 
 ![Stilla](docs/screenshots/hero.png)
+
+*截图均为虚构的演示数据。 / All screenshots show made-up demo data.*
+
+## 它解决这几件事
+
+| 你遇到的问题 | Stilla 怎么做 |
+|---|---|
+| 不知道还剩多少 | 两滴墨常驻，60% 变橙、85% 变红，到顶前先知道 |
+| 不知道谁最费 | 会话视图一行一个会话，缓存剩余也在上面 |
+| 不知道哪个模型花得多 | 模型视图折成额度，思考档位也单独列出（额度折算需要 Python，可选） |
+| token 多就以为费额度 | 对比视图并排占比，缓存读便宜，看额度更准 |
+| 订阅不知值不值 | 折成 API 金额，算出回本倍数 |
+| 怕额度提前用完 | 按近 12 小时的速度预测每周额度会不会在重置前用完，提前调整 |
+| 续费日记不住 | 自动识别账号，续费前系统通知 |
+| 想看某个时段 | 11 个时间标签，可自定义 |
+| 怕挡着写代码 | 16 种风格，透明度可调，`Ctrl+Alt+B` 反色 |
+
+额度折算是估算，误差约 5%，用来判断趋势，不当账单（程序里会显示当前的"估算误差"）。
 
 ## 能做什么
 
@@ -26,7 +46,7 @@
 
 只支持 **Windows 10 / 11**（用系统自带的 .NET Framework 4，不用另装运行库）。
 
-1. 从 [Releases](../../releases) 下载 `Stilla-Setup-0.1.0-zh.exe`（中文界面；英文界面版是 `-en.exe`），双击安装（不需要管理员权限，装在 `%LOCALAPPDATA%\Programs\Stilla`）。不想安装的话下载 `Stilla-0.1.0-portable-zh.zip`，解压即用。
+1. 从 [Releases](../../releases) 下载 `Stilla-Setup-0.1.0-zh.exe`（目前只有中文界面），双击安装（不需要管理员权限，装在 `%LOCALAPPDATA%\Programs\Stilla`）。不想安装的话下载 `Stilla-0.1.0-portable-zh.zip`，解压即用。
 2. 安装程序里**勾选「配置 Claude Code 状态栏」**（见下）。会修改 `~/.claude/settings.json`：先备份、保留你已有的状态栏、卸载时撤销。不勾也行，装好后在 Stilla 右键菜单里再设。
 3. 重启 Claude Code，发一条消息，悬浮窗就有数据了。
 
@@ -79,6 +99,25 @@ Claude Code 没有公开的"查额度"接口，所以有三种方式，在右键
 - **每次启动时检查一次**（右键 → 设置… 里可以关）：向 GitHub 请求一次"最新 Release 是哪个版本"，只带 `User-Agent: Stilla/版本号`，不发送你的任何数据。
 - 有新版本：Stilla 标志右边出现一个**小红点**（托盘也会弹一次提示）。点小红点，或右键 → 设置… → **前往更新页面**，在浏览器里打开下载页。**不会自动下载、不会自动安装**。
 - 免联网：设置里取消勾选，或设环境变量 `STILLA_NO_UPDATE_CHECK=1`。
+- 检查更新要能连上 GitHub（`api.github.com`）。连不上时设置窗口会写"检查失败"，这时不会出现小红点，可以自己打开 [Releases](../../releases) 看。
+
+## 下一版预告（尚未包含在 0.1.0）
+
+下面这些功能已经在作者自己的电脑上用着，会抽空尽快整理上线，不承诺日期。上线后，已经装了 Stilla 的人会在悬浮窗上看到更新小红点，不用自己去搜更新。
+
+| 你遇到的问题 | 下一版怎么做 |
+|---|---|
+| 缓存过期，重新载入贵 | 每个会话一盏灯：绿 = 运行中，蓝 = 等你处理，倒计时越短越黄越红 |
+| 会话一多，找不到等回复的 | 会话名点击转跳到所在窗口 |
+| 忙别的忘了续缓存 | 快过期弹系统通知；还能发邮件到你自己的邮箱（自备 SMTP） |
+| 不知道谁在烧额度 | 每个会话显示近 15 分钟的速度和占用 |
+| 撑不撑得到重置没底 | 合计行直接写：照现在的速度，5 小时额度约几小时后触顶，每周额度会不会提前用完 |
+| 一周花在哪记不清 | 每周自动出 HTML 周报：每天花费、小时热力图、模型 × 档位、最烧的会话、较上周变化 |
+| 找不到最费的会话 | 表头点一下排序，成本列显示 API 等价金额 |
+| 会话用了什么模型 | 模型视图点会话：各模型 × 档位的用量，中途切换的时间线，可复制 |
+| 接了非 Claude 模型，花销没人算 | API 视图列出用量和估算费用 |
+| 折算准不准、数字怎么算的 | 估算自检有偏差会提示，鼠标停一下弹出说明 |
+| 打游戏怕占资源 | 三档调度，精简只留缓存提醒；还能一键暂停后台读取 |
 
 <a name="donate"></a>
 

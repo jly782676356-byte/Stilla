@@ -9,6 +9,24 @@
 
 ![Stilla](docs/screenshots/hero.png)
 
+*All screenshots show made-up demo data.*
+
+## What it solves
+
+| The problem | What Stilla does |
+|---|---|
+| Don't know how much is left | Two ink drops stay on screen; they turn orange at 60% and red at 85%, so you see the cap coming |
+| Don't know which session costs the most | Sessions view: one row per session, with the cache time left on it |
+| Don't know which model burns the most | Models view converts usage into quota share, with thinking levels listed separately (quota conversion needs Python, optional) |
+| More tokens must mean more quota? | Compare view puts token share and quota share side by side; cache reads are cheap, so quota is the better number |
+| Is the subscription worth it? | Converts usage to its API-equivalent price and shows your payback multiple |
+| Afraid of running out early | Forecasts from the last 12 hours of usage whether the weekly quota will run out before it resets |
+| Can't remember the renewal date | Detects your account automatically and sends a system notification before renewal |
+| Want to look at one particular period | 11 time ranges, plus a custom one |
+| Worried it blocks your code | 16 skins, adjustable transparency, `Ctrl+Alt+B` inverts light/dark |
+
+The quota conversion is an estimate with an error of around 5%: use it to judge trends, not as a bill (the app shows the current estimation error).
+
 ## Features
 
 - Floating widget: 5-hour / weekly percent used, reset time, countdown; draggable, resizable, adjustable transparency, tray icon.
@@ -22,7 +40,7 @@
 
 Windows 10 / 11 only (uses the .NET Framework 4 that ships with Windows).
 
-1. Download `Stilla-Setup-0.1.0.exe` from Releases and run it (no admin rights needed).
+1. Download `Stilla-Setup-0.1.0-zh.exe` from [Releases](../../releases) and run it (no admin rights needed; the UI is Chinese only for now). Prefer no installer? Download `Stilla-0.1.0-portable-zh.zip` and unzip it.
 2. Tick **"Configure the Claude Code status line"**. This edits `~/.claude/settings.json`: it makes a backup first, keeps any status line you already have (it chains to it), and is undone on uninstall. You can also do it later from the widget's right-click menu.
 3. Restart Claude Code and send a message.
 
@@ -43,6 +61,28 @@ Session usage is read from the session logs Claude Code writes locally (`project
 ## Privacy
 
 With the default Auto mode Stilla does not read the login token unless you agree in the dialog (and never needs it while the status line delivers data); the only other network use is the update check. See [PRIVACY.md](PRIVACY.md) (Chinese) for exactly which local files are read and written. Usage logs contain session titles and project paths; do not paste the `logs` folder into issues.
+
+## Updates
+
+Stilla checks GitHub for a newer Release once at each launch (on by default; turn it off in the settings window). When there is one, a small red dot appears next to the Stilla mark; "前往更新页面" opens the Release page. It never downloads or installs anything by itself. It needs to reach `api.github.com`; if it can't, the settings window says the check failed and no dot appears.
+
+## Coming next (not in 0.1.0)
+
+These already run on the author's own machine and will be released as soon as time allows (no date promised). Once they are out, everyone who has Stilla installed will see the update dot, so there is no need to search for updates.
+
+| The problem | What the next version does |
+|---|---|
+| Cache expires and reloading is expensive | One light per session: green = running, blue = waiting for you; the closer the cache is to expiring, the more yellow, then red |
+| Too many sessions to find the one waiting on you | Click a session name to jump to the window it lives in |
+| Forget to keep the cache warm while busy | A system notification before it expires; optionally an email to yourself (bring your own SMTP) |
+| Don't know who is burning quota | Each session shows its speed and share over the last 15 minutes |
+| Unsure you will last until the reset | The total row says it outright: at the current pace the 5-hour quota hits the cap in about N hours, and whether the weekly quota runs out early |
+| Can't remember where the week went | An automatic weekly HTML report: daily cost, hourly heatmap, model × level, the most expensive sessions, change vs. last week |
+| Can't find the costliest session | Click a column header to sort; the cost column shows the API-equivalent amount |
+| Which model did a session use? | Models view, click a session: usage per model × level and a timeline of mid-session switches, copyable |
+| Using non-Claude models and nobody tracks the cost | The API view lists usage and estimated cost |
+| How accurate is the conversion, and how are the numbers computed? | The estimate self-check warns when it drifts, and a hover tooltip explains the numbers |
+| Gaming and worried about resources | Three-level scheduling (the lightest keeps only cache reminders), plus one-click pause of background reading |
 
 ## Support the project
 
