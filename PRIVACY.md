@@ -7,7 +7,7 @@
 | 什么时候 | 联网吗 |
 |---|---|
 | **额度来源 = 状态栏**，或「自动」（默认）里状态栏有新数据时 | 这一项**不联网、不读登录令牌**。没有遥测、没有崩溃上报。 |
-| **检查更新**（默认开，设置里可关） | 每次启动约 4 秒后，向 `https://api.github.com/repos/<owner>/<repo>/releases/latest` 发**一个 GET 请求**，只问"最新 Release 的版本号和页面地址"。请求里只有 `User-Agent: Stilla/<版本号>` 和 `Accept: application/vnd.github+json`，**不带 cookie、不带令牌、不带你的任何数据**（GitHub 当然能看到你的 IP，和访问任何网站一样）。不会自动下载、不会自动安装；接口返回的链接只有以 `https://github.com/` 开头才会采用。关掉：设置 → 取消勾选，或环境变量 `STILLA_NO_UPDATE_CHECK=1`。仓库地址还是占位符 `OWNER` 时不联网。（`src/Update.cs`） |
+| **检查更新**（默认开，设置里可关） | 每次启动约 4 秒后，向 `https://api.github.com/repos/<owner>/<repo>/releases/latest` 发**一个 GET 请求**，只问"最新 Release 的版本号和页面地址"。请求里只有 `User-Agent: Stilla/<版本号>` 和 `Accept: application/vnd.github+json`，**不带 cookie、不带令牌、不带你的任何数据**（GitHub 当然能看到你的 IP，和访问任何网站一样）。不会自动下载、不会自动安装；接口返回的链接只有以 `https://github.com/` 开头才会采用。关掉：设置 → 取消勾选，或环境变量 `STILLA_NO_UPDATE_CHECK=1`。如果你 fork 了本项目、没有改仓库地址，你构建出来的版本会检查本项目的新版本；用 `tools\set-repo.ps1` 可以改成你自己的仓库。（`src/Update.cs`） |
 | 在线查询，或「自动」里状态栏没有新数据时（**都需要你在弹窗里确认**；「自动」是默认来源，所以第一次状态栏没数据时会弹一次提问，点「否」就不会读令牌、不会联网，之后不再问；答案记在 `settings.txt` 的 `onl=`） | 请求 `https://api.anthropic.com/api/oauth/usage`，带上本机 Claude 登录令牌（`Bearer`）。每 60 秒一次，只读，不发消息。令牌只在内存里用，不保存、不发给别处。（`src/Main.cs` 的 `UsageClient`） |
 
 邮件、云同步、崩溃上报、使用统计：都没有。点「前往更新页面」/「捐赠…」只是用你的默认浏览器打开一个网址。

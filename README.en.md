@@ -11,6 +11,12 @@
 
 *All screenshots show made-up demo data.*
 
+| Five views: Session · Model · Compare · Tier · Plan | 16 skins, paper and ink |
+|:---:|:---:|
+| <img src="docs/screenshots/views.gif" alt="The five usage views" width="400"> | <img src="docs/screenshots/skins.gif" alt="The 16 skins" width="250"> |
+
+*The two animations are slideshows of screenshots rendered from demo data, not screen recordings.*
+
 ## What it solves
 
 | The problem | What Stilla does |
@@ -44,7 +50,13 @@ Windows 10 / 11 only (uses the .NET Framework 4 that ships with Windows).
 2. Tick **"Configure the Claude Code status line"**. This edits `~/.claude/settings.json`: it makes a backup first, keeps any status line you already have (it chains to it), and is undone on uninstall. You can also do it later from the widget's right-click menu.
 3. Restart Claude Code and send a message.
 
-The installer is **not code-signed**, so SmartScreen may warn. You can build from source instead: `powershell -ExecutionPolicy Bypass -File build.ps1` (only needs the `csc.exe` that ships with Windows).
+> **About the "unknown publisher" warning.** The installer is **not code-signed** (this is a personal project without a paid signing certificate), so Windows SmartScreen may show "Windows protected your PC" (click **More info → Run anyway**), and a few antivirus programs may flag it. To check that your download is what was published:
+>
+> ```powershell
+> certutil -hashfile Stilla-Setup-0.1.0-zh.exe SHA256
+> ```
+>
+> The output must match this file's line in `SHA256SUMS-zh.txt` on the Release page. The source is public and has no third-party dependencies, so you can also build it yourself with `powershell -ExecutionPolicy Bypass -File build.ps1` (it only needs the `csc.exe` that ships with Windows).
 
 ## Where the numbers come from
 

@@ -13,6 +13,12 @@
 
 *截图均为虚构的演示数据。 / All screenshots show made-up demo data.*
 
+| 五个视图：会话 · 模型 · 对比 · 档位 · 订阅 | 16 种风格 × 纸色 / 墨底 |
+|:---:|:---:|
+| <img src="docs/screenshots/views.gif" alt="五个视图轮播" width="400"> | <img src="docs/screenshots/skins.gif" alt="16 种风格轮播" width="250"> |
+
+*上面两张动图是演示数据渲染图的轮播，不是屏幕录像。*
+
 ## 它解决这几件事
 
 | 你遇到的问题 | Stilla 怎么做 |
@@ -50,7 +56,13 @@
 2. 安装程序里**勾选「配置 Claude Code 状态栏」**（见下）。会修改 `~/.claude/settings.json`：先备份、保留你已有的状态栏、卸载时撤销。不勾也行，装好后在 Stilla 右键菜单里再设。
 3. 重启 Claude Code，发一条消息，悬浮窗就有数据了。
 
-> 安装包**没有代码签名**，Windows SmartScreen 可能提示"未知发布者"（点「更多信息 → 仍要运行」），个别杀毒软件可能误报。不放心可以自己 [从源码构建](#从源码构建)，或对照 Release 页上的 SHA-256。
+> **关于"未知发布者"提示**：安装包**没有代码签名**（个人项目，没有买签名证书），所以 Windows SmartScreen 可能提示"Windows 已保护你的电脑"，点「更多信息 → 仍要运行」即可；个别杀毒软件也可能误报。想确认下载的文件和发布的一致，可以核对 SHA-256：
+>
+> ```powershell
+> certutil -hashfile Stilla-Setup-0.1.0-zh.exe SHA256
+> ```
+>
+> 输出应与 Release 页里 `SHA256SUMS-zh.txt` 中这个文件的那一行一致。源码全部公开、没有第三方依赖，也可以直接 [从源码构建](#从源码构建)，只需要 Windows 自带的 `csc.exe`。
 
 静默安装 / 卸载：`Stilla-Setup-0.1.0-zh.exe /S [/D=安装目录] [/nostatusline] [/desktop] [/autostart] [/nolaunch]`；`Stilla-Setup.exe /uninstall /S [/purge]`。
 
