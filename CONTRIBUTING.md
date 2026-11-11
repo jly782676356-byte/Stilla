@@ -1,5 +1,7 @@
 # 参与贡献
 
+> **English:** [CONTRIBUTING.md (English edition)](https://github.com/jly782676356-byte/Stilla/blob/main/en/CONTRIBUTING.md)
+
 欢迎 issue 和 PR。这是个业余项目，响应可能比较慢。
 
 ## 报问题时请带上

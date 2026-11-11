@@ -1,5 +1,7 @@
 # 更新记录
 
+> **English:** [CHANGELOG.md (English edition)](https://github.com/jly782676356-byte/Stilla/blob/main/en/CHANGELOG.md)
+
 ## 0.1.1
 
 **新增：英文界面版**

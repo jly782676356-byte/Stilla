@@ -5,7 +5,7 @@
 > **Stilla is an independent community project. It is not made, endorsed or supported by Anthropic.**
 > "Claude" is a trademark of Anthropic, PBC; it is used here only to say what the tool works with.
 
-[中文](../README.md)  ·  This folder is the **English-UI edition**; the repository root holds the Chinese-UI edition and the main page.
+[中文](../README.zh-CN.md)  ·  This folder is the source of the **English-UI edition**; the repository root ([README.md](../README.md)) holds the main page and the Chinese-UI source.
 
 ![Stilla](docs/screenshots/hero.png)
 
@@ -98,7 +98,7 @@ The **quota percentages** depend on the data source (previous section): the stat
 
 ## Support this project
 
-Stilla is free and open source, with no paid features; donating is entirely optional and unlocks nothing. If it is useful to you, you can support its upkeep through [GitHub Sponsors](https://github.com/sponsors/jly782676356-byte) (one-time or monthly). WeChat / Alipay QR codes are in the [Chinese README](../README.md#donate). Settings... → Donate... in the program opens that section.
+Stilla is free and open source, with no paid features; donating is entirely optional and unlocks nothing. If it is useful to you, you can support its upkeep through [GitHub Sponsors](https://github.com/sponsors/jly782676356-byte) (one-time or monthly). WeChat / Alipay QR codes are in the [main README](../README.md#donate). Settings... → Donate... in the program opens that section.
 
 ## Privacy
 

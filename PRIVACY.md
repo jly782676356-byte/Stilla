@@ -1,5 +1,7 @@
 # 隐私：Stilla 读什么、写什么、联不联网
 
+> **English:** [PRIVACY.md (English edition)](https://github.com/jly782676356-byte/Stilla/blob/main/en/PRIVACY.md)
+
 适用版本：0.1.1。源码都在仓库里，下面每一条都能在代码里对上（文件路径见括号）。
 
 ## 联网

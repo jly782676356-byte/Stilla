@@ -1,5 +1,7 @@
 # Stilla 使用说明（0.1.1）
 
+> **English:** [docs/USAGE.md (English edition)](https://github.com/jly782676356-byte/Stilla/blob/main/en/docs/USAGE.md)
+
 ## 悬浮窗
 
 - 拖动窗口任意位置移动；拖边缘 / 四个角调整大小（位置和大小会记住）。

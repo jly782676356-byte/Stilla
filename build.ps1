@@ -54,7 +54,7 @@ Copy-Item (Join-Path $root "scripts\*.py") $scripts -Force
 $setupName = "Stilla-Setup-$version-$edition.exe"
 $res = @("/resource:$dist\Stilla.exe,res/Stilla.exe", "/resource:$dist\Stilla.Statusline.exe,res/Stilla.Statusline.exe")
 foreach ($py in Get-ChildItem $scripts -Filter *.py) { $res += "/resource:$($py.FullName),res/scripts/$($py.Name)" }
-foreach ($doc in "LICENSE", "README.md") { if (Test-Path (Join-Path $root $doc)) { $res += "/resource:$(Join-Path $root $doc),res/$doc" } }
+foreach ($doc in "LICENSE", "README.zh-CN.md") { if (Test-Path (Join-Path $root $doc)) { $res += "/resource:$(Join-Path $root $doc),res/$doc" } }
 Push-Location (Join-Path $root "src")
 try {
     $setup = $common + @(
@@ -74,7 +74,7 @@ $dir = Join-Path $stage "Stilla"
 New-Item -ItemType Directory -Force (Join-Path $dir "scripts") | Out-Null
 Copy-Item "$dist\Stilla.exe", "$dist\Stilla.Statusline.exe" $dir
 Copy-Item "$scripts\*.py" (Join-Path $dir "scripts")
-foreach ($doc in "LICENSE", "README.md", "PRIVACY.md") { if (Test-Path (Join-Path $root $doc)) { Copy-Item (Join-Path $root $doc) $dir } }
+foreach ($doc in "LICENSE", "README.zh-CN.md", "PRIVACY.md") { if (Test-Path (Join-Path $root $doc)) { Copy-Item (Join-Path $root $doc) $dir } }
 [IO.File]::WriteAllText((Join-Path $dir "portable.txt"), "", (New-Object Text.UTF8Encoding($false)))
 $zip = Join-Path $dist "Stilla-$version-portable-$edition.zip"
 Remove-Item $zip -Force -ErrorAction SilentlyContinue
