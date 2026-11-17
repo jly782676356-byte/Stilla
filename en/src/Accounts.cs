@@ -257,6 +257,10 @@ namespace Stilla
         {
             LoginInfo li = new LoginInfo();
             string envDir = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+            if (string.IsNullOrEmpty(envDir) && ClaudeRoots.Isolated)
+            {
+                envDir = ClaudeRoots.Primary();     // Demo / isolated mode: do not read the real ~\.claude.json
+            }
             string cfgJson = string.IsNullOrEmpty(envDir)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude.json")
                 : Path.Combine(envDir, ".claude.json");
@@ -612,6 +616,13 @@ namespace Stilla
         // From now on usage belongs to an account / plan. Nothing is recorded if it is the same as the last entry. Returns whether something was actually recorded
         public static bool SetCurrent(string accountId, string plan, string source)
         {
+            return SetCurrent(accountId, plan, source, null);
+        }
+
+        // When snapshotPath is not empty (used for auto-detection): the plan / account in the login file is often updated well after the real switch (this time more than an hour late),
+        // so look in the quota snapshots for the moment the quota reading suddenly dropped to zero and record the switch time as that moment; then the conversion factor follows the real account / plan
+        public static bool SetCurrent(string accountId, string plan, string source, string snapshotPath)
+        {
             lock (gate)
             {
                 TimelineEntry last = timeline.Count == 0 ? null : timeline[timeline.Count - 1];
@@ -625,10 +636,105 @@ namespace Stilla
                 e.AccountId = accountId;
                 e.Plan = plan;
                 e.Source = source;
+                if (snapshotPath != null && last != null)
+                {
+                    DateTime? at = FindCounterReset(snapshotPath, last.Utc);
+                    if (at.HasValue && at.Value > last.Utc && at.Value < e.Utc)
+                    {
+                        e.Utc = at.Value;
+                        e.Source = source + " (corrected to when the quota reading dropped to zero)";
+                    }
+                }
                 timeline.Add(e);
             }
             SaveTimeline();
             return true;
+        }
+
+        // Look in the last 12 hours of quota_snapshots.csv for the latest time the reading suddenly dropped to zero before its window ended: the 5-hour reading fell by >= 10 points, or the weekly reading by >= 2 points,
+        // while the reset time recorded on the previous row is still in the future - this can only be a plan or account change (a normal window expiry does not count, since the reset time has already passed then).
+        // Returns the time of that row (UTC), which must be later than afterUtc; returns null if there is none
+        public static DateTime? FindCounterReset(string path, DateTime afterUtc)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
+                string text;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long take = Math.Min(fs.Length, 256 * 1024);
+                    fs.Seek(fs.Length - take, SeekOrigin.Begin);
+                    byte[] buf = new byte[take];
+                    int got = 0;
+                    while (got < buf.Length)
+                    {
+                        int n = fs.Read(buf, got, buf.Length - got);
+                        if (n <= 0)
+                        {
+                            break;
+                        }
+                        got += n;
+                    }
+                    text = Encoding.UTF8.GetString(buf, 0, got);
+                }
+                DateTime nowUtc = DateTime.UtcNow;
+                DateTime? found = null;
+                bool havePrev = false;
+                double prev5 = 0, prevW = 0;
+                DateTime prevReset5 = DateTime.MinValue, prevResetW = DateTime.MinValue;
+                foreach (string line in text.Split('\n'))
+                {
+                    string[] f = line.TrimEnd('\r').Split(',');
+                    DateTime t;
+                    if (f.Length < 5 || !DateTime.TryParseExact(f[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    double p5 = -1, pw = -1;
+                    DateTime r5 = DateTime.MinValue, rw = DateTime.MinValue;
+                    double v;
+                    if (double.TryParse(f[1], NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                    {
+                        p5 = v;
+                    }
+                    if (double.TryParse(f[3], NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                    {
+                        pw = v;
+                    }
+                    DateTime.TryParseExact(f[2], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out r5);
+                    DateTime.TryParseExact(f[4], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out rw);
+                    if (havePrev)
+                    {
+                        DateTime guard = t.AddMinutes(2);
+                        bool drop5 = prev5 >= 0 && p5 >= 0 && prev5 - p5 >= 10 && prevReset5 > guard;
+                        bool dropW = prevW >= 0 && pw >= 0 && prevW - pw >= 2 && prevResetW > guard;
+                        if (drop5 || dropW)
+                        {
+                            DateTime u = DateTime.SpecifyKind(t, DateTimeKind.Local).ToUniversalTime();
+                            if (u > afterUtc && nowUtc - u < TimeSpan.FromHours(12))
+                            {
+                                found = u;
+                            }
+                        }
+                    }
+                    if (p5 >= 0 || pw >= 0)
+                    {
+                        havePrev = true;
+                        prev5 = p5;
+                        prevW = pw;
+                        prevReset5 = r5;
+                        prevResetW = rw;
+                    }
+                }
+                return found;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         public static void ReplaceTimeline(List<TimelineEntry> list)
@@ -911,7 +1017,8 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(660, 420);
+            DialogDpi.Apply(this);
+            ClientSize = new Size(780, 440);
 
             list.Location = new Point(12, 12);
             list.Size = new Size(210, 300);
@@ -922,10 +1029,10 @@ namespace Stilla
             add.Click += delegate { AddItem(); };
             Button del = MakeButton("Delete", 122, 320, 100);
             del.Click += delegate { DeleteItem(); };
-            Button tl = MakeButton("Switch records...", 12, 380, 100);
+            Button tl = MakeButton("Switch records...", 12, 400, 130);
             tl.Click += delegate { EditTimeline(); };
 
-            int x = 240, cx = 350;
+            int x = 240, cx = 366;
             AddLabel("ID", x, 16);
             lblId.Location = new Point(cx, 16);
             lblId.AutoSize = true;
@@ -969,10 +1076,11 @@ namespace Stilla
             numFee.ValueChanged += delegate { SaveFields(); };
             Controls.Add(numFee);
             Label feeTip = new Label();
-            feeTip.Text = "The default is only a reference to the official list price; change it to what you actually pay";
+            feeTip.Text = "Default is the official list price; enter what you actually pay";
             feeTip.ForeColor = SystemColors.GrayText;
-            feeTip.Location = new Point(cx + 108, 150);
-            feeTip.AutoSize = true;
+            feeTip.Location = new Point(cx + 108, 146);
+            feeTip.AutoSize = false;
+            feeTip.Size = new Size(280, 36);
             Controls.Add(feeTip);
 
             AddLabel("Note", x, 184);
@@ -988,11 +1096,11 @@ namespace Stilla
             Controls.Add(lblBind);
             btnBind.Text = "Bind current login";
             btnBind.Location = new Point(cx, 292);
-            btnBind.Size = new Size(110, 28);
+            btnBind.Size = new Size(130, 28);
             btnBind.Click += delegate { BindCurrent(); };
             Controls.Add(btnBind);
             btnUnbind.Text = "Unbind";
-            btnUnbind.Location = new Point(cx + 118, 292);
+            btnUnbind.Location = new Point(cx + 138, 292);
             btnUnbind.Size = new Size(90, 28);
             btnUnbind.Click += delegate { UnbindCurrent(); };
             Controls.Add(btnUnbind);
@@ -1001,12 +1109,12 @@ namespace Stilla
             tip.Text = "Once bound, log in to this account in Claude Code and the widget switches to it automatically;\r\naccounts that are not bound can be chosen manually.";
             tip.ForeColor = SystemColors.GrayText;
             tip.Location = new Point(cx, 330);
-            tip.Size = new Size(300, 36);
+            tip.Size = new Size(400, 52);
             Controls.Add(tip);
 
-            Button ok = MakeButton("OK", 470, 380, 80);
+            Button ok = MakeButton("OK", 570, 400, 80);
             ok.DialogResult = DialogResult.OK;
-            Button cancel = MakeButton("Cancel", 560, 380, 80);
+            Button cancel = MakeButton("Cancel", 660, 400, 80);
             cancel.DialogResult = DialogResult.Cancel;
             AcceptButton = ok;
             CancelButton = cancel;
@@ -1217,16 +1325,17 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(560, 400);
+            DialogDpi.Apply(this);
+            ClientSize = new Size(620, 400);
 
             Label tip = new Label();
-            tip.Text = "Each row: from this time on, usage belongs to which account and plan. A row is added automatically when the widget switches login account or plan;\r\nthe history is reconstructed from the session transcripts, so if it is wrong you can add or delete rows here.";
+            tip.Text = "Each row: from this time on, usage belongs to this account and plan. A row is added automatically when you switch login account or plan;\r\nhistory is rebuilt from session records; if it is wrong, add or delete rows here.";
             tip.Location = new Point(12, 8);
-            tip.Size = new Size(540, 36);
+            tip.Size = new Size(600, 52);
             Controls.Add(tip);
 
-            lv.Location = new Point(12, 48);
-            lv.Size = new Size(536, 250);
+            lv.Location = new Point(12, 66);
+            lv.Size = new Size(596, 232);
             lv.View = View.Details;
             lv.FullRowSelect = true;
             lv.MultiSelect = false;
@@ -1241,13 +1350,13 @@ namespace Stilla
             l1.Location = new Point(12, 312);
             l1.AutoSize = true;
             Controls.Add(l1);
-            dt.Location = new Point(70, 308);
+            dt.Location = new Point(112, 308);
             dt.Size = new Size(150, 24);
             dt.Format = DateTimePickerFormat.Custom;
             dt.CustomFormat = "yyyy-MM-dd HH:mm";
             dt.Value = DateTime.Now;
             Controls.Add(dt);
-            cboAcc.Location = new Point(230, 308);
+            cboAcc.Location = new Point(272, 308);
             cboAcc.Size = new Size(130, 24);
             cboAcc.DropDownStyle = ComboBoxStyle.DropDownList;
             foreach (Account a in accounts)
@@ -1259,7 +1368,7 @@ namespace Stilla
                 cboAcc.SelectedIndex = 0;
             }
             Controls.Add(cboAcc);
-            cboPlan.Location = new Point(368, 308);
+            cboPlan.Location = new Point(410, 308);
             cboPlan.Size = new Size(100, 24);
             cboPlan.DropDownStyle = ComboBoxStyle.DropDownList;
             foreach (string n in PlanInfo.Names)
@@ -1270,7 +1379,7 @@ namespace Stilla
             Controls.Add(cboPlan);
             Button add = new Button();
             add.Text = "Add";
-            add.Location = new Point(476, 306);
+            add.Location = new Point(518, 306);
             add.Size = new Size(72, 28);
             add.Click += delegate { AddEntry(); };
             Controls.Add(add);
@@ -1289,18 +1398,18 @@ namespace Stilla
             Button del = new Button();
             del.Text = "Delete selected";
             del.Location = new Point(12, 360);
-            del.Size = new Size(90, 28);
+            del.Size = new Size(112, 28);
             del.Click += delegate { DeleteEntry(); };
             Controls.Add(del);
             Button ok = new Button();
             ok.Text = "OK";
-            ok.Location = new Point(380, 360);
+            ok.Location = new Point(440, 360);
             ok.Size = new Size(80, 28);
             ok.DialogResult = DialogResult.OK;
             Controls.Add(ok);
             Button cancel = new Button();
             cancel.Text = "Cancel";
-            cancel.Location = new Point(468, 360);
+            cancel.Location = new Point(528, 360);
             cancel.Size = new Size(80, 28);
             cancel.DialogResult = DialogResult.Cancel;
             Controls.Add(cancel);

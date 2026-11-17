@@ -31,8 +31,9 @@ try {
     # The widget: a window application (no console)
     $gui = $common + @(
         "/target:winexe", "/win32icon:..\assets\Stilla.ico", "/out:$dist\Stilla.exe",
-        "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:System.Web.Extensions.dll",
-        "Main.cs", "Source.cs", "Shared.cs", "Update.cs", "Settings.cs", "Skins.cs", "Skins2.cs", "Accounts.cs", "AssemblyInfo.cs")
+        "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:System.Web.Extensions.dll", "/r:System.Security.dll",
+        "Main.cs", "Source.cs", "Shared.cs", "Update.cs", "Settings.cs", "Skins.cs", "Skins2.cs", "Accounts.cs",
+        "Details.cs", "Extras.cs", "Features.cs", "Jump.cs", "Mail.cs", "Report.cs", "Tips.cs", "WidgetExtra.cs", "AssemblyInfo.cs")
     & $csc $gui
     if ($LASTEXITCODE -ne 0) { throw "Stilla.exe failed to compile" }
 

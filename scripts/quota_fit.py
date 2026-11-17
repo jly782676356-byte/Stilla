@@ -80,7 +80,9 @@ TIER = {
 TAU = 0.5            # 先验：各模型的「每美元额度」和全体平均相差多少（相对值，0.5 = 一般不会偏离一半以上）
 QUANT_SD = 0.29      # 整数百分比的舍入误差（均匀分布）的标准差，拟合残差的下限参考
 HUBER_C = 1.5
-MIN_POINTS = 40      # 参与拟合的点少于这个数就不写结果
+MIN_POINTS = 40      # 参与拟合的点少于这个数就不写结果（留一块验证、档位修正用）
+MIN_FIT_POINTS = 30  # 一个口径的 5 小时系数至少要有这么多个点；不够就按套餐倍率从别的口径推算
+MIN_FIT_R2 = 0.9     # 拟合优度（组内 R²）低于这个就不用：数据多半跨了套餐 / 账号变化，不如不出结果
 FOLD_HOURS = 2.0     # 留一法验证：把曲线按 2 小时切块，每块用「其余块」拟合的系数去预测它的增量
 MIN_FOLD_DELTA = 3   # 验证只看增量 >= 3 个百分点的块（太小的块被舍入误差淹没）
 LAGS = [-120, -60, 0, 60, 120, 180, 300]
@@ -725,8 +727,11 @@ def analyse5(snaps, msgs, lines, by_mode=None):
 
     pts, seginfo = build_points(msgs, segs, models, best_lag, best_rho, 'cost')
     f = fit(pts, nmod, TAU)
-    if f is None or f['n'] < MIN_POINTS:
+    if f is None or f['n'] < MIN_FIT_POINTS:
         lines.append('点数太少（%d），不出结果。' % (0 if f is None else f['n']))
+        return None
+    if f['r2'] < MIN_FIT_R2:
+        lines.append('拟合优度太低（R2=%.3f，点数 %d）：这个口径的数据多半跨了套餐 / 账号变化，不出结果。' % (f['r2'], f['n']))
         return None
 
     # 当前口径：逐段斜率 → 口径变了就只用最近一段，否则按精度和新旧加权

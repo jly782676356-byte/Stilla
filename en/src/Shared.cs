@@ -17,7 +17,7 @@ namespace Stilla
     internal static class AppInfo
     {
         public const string Name = "Stilla";
-        public const string Version = "0.1.1";
+        public const string Version = "0.2.0";
         public const string Disclaimer = "Stilla is an independent community project. It is not made or endorsed by Anthropic. Claude is a trademark of Anthropic, PBC.";
 
         // The project's GitHub repository: "check for updates", "go to update page" and "donate" all point here.
@@ -419,7 +419,8 @@ namespace Stilla
             string d = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
             if (string.IsNullOrEmpty(d))
             {
-                d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+                // Demo / isolated mode without CLAUDE_CONFIG_DIR: do not touch the real ~\.claude, point to a folder that does not exist inside the data folder (reading it gives nothing)
+                d = Isolated ? Path.Combine(AppPaths.Home, "claude-isolated") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
             }
             return d;
         }

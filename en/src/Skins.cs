@@ -133,7 +133,7 @@ namespace Stilla
             InkPainter.DrawLogo(g, pad, 7f * s, s, p.Main);
             SkinDraw.Text(g, "STILLA", f.Display, p.Main, new RectangleF(pad + 24f * s, 5f * s, 140f * s, 22f * s), StringAlignment.Near);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
         }
     }
 
@@ -192,6 +192,9 @@ namespace Stilla
             {
                 return;
             }
+#if UICHECK
+            UiProbe.Text(g, text, font, r, a);      // layout check: compiled only into tools/ui-check Harness, not in release builds
+#endif
             using (StringFormat sf = new StringFormat())
             {
                 sf.Alignment = a;
@@ -232,7 +235,8 @@ namespace Stilla
                 Text(g, text, font, c, r, a);
                 return;
             }
-            float k = Math.Max(0.6f, r.Width / need * 0.97f);
+            // floor is 0.5 (was 0.6): the long "not started yet" clock text in a narrow tile still did not fit at 0.6
+            float k = Math.Max(0.5f, r.Width / need * 0.97f);
             using (Font small = new Font(font.FontFamily, font.Size * k, font.Style, font.Unit))
             {
                 Text(g, text, small, c, r, a);
@@ -926,9 +930,10 @@ namespace Stilla
             }
             using (Font lf = ShrinkFont(f.Small, t.LabelScale))
             {
-                SkinDraw.Text(g, t.Label, lf, t.Selected ? p.Main : p.Dim, new RectangleF(cell.X, y0 + 34f * s + 6f * s, cell.Width, 14f * s), StringAlignment.Center);
+                SkinDraw.Text(g, t.Label, lf, t.Selected ? p.Main : p.Dim, new RectangleF(cell.X, y0 + 34f * s + 4f * s, cell.Width, 14f * s), StringAlignment.Center);
             }
-            SkinDraw.Fit(g, t.Value, f.Label, t.Selected ? p.Main : p.Dim, new RectangleF(cell.X, y0 + 34f * s + 20f * s, cell.Width, 16f * s), StringAlignment.Center);
+            // 3 px higher than before: the value used to touch the big total number underneath
+            SkinDraw.Fit(g, t.Value, f.Label, t.Selected ? p.Main : p.Dim, new RectangleF(cell.X, y0 + 34f * s + 17f * s, cell.Width, 16f * s), StringAlignment.Center);
         }
 
         // Share: a small cylinder lying on its side

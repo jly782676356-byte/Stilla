@@ -178,11 +178,16 @@ namespace Stilla
                 return null;
             }
             Quota q = new Quota();
-            q.Percent = Math.Max(0.0, StatusLineCli.ToDouble(u));
+            double pctRaw = StatusLineCli.ToDouble(u);
+            if (double.IsNaN(pctRaw) || double.IsInfinity(pctRaw))
+            {
+                pctRaw = 0;
+            }
+            q.Percent = Math.Max(0.0, pctRaw);
             if (d.TryGetValue("resets_at", out t) && t != null)
             {
                 double secs = StatusLineCli.ToDouble(t);
-                if (secs > 0)
+                if (secs > 0 && secs < 253402300799.0)
                 {
                     q.ResetsAt = RoundMinute(FromEpoch(secs));
                     if (q.ResetsAt.Value <= now)
@@ -196,6 +201,10 @@ namespace Stilla
 
         private static DateTime FromEpoch(double secs)
         {
+            if (double.IsNaN(secs) || secs < 0 || secs > 253402300799.0)
+            {
+                return DateTime.Now;        // 文件里的时间戳荒谬（损坏 / 手改）：当作「刚刚」，别抛异常
+            }
             return Epoch.AddSeconds(secs).ToLocalTime();
         }
 

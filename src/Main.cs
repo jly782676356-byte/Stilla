@@ -78,7 +78,7 @@ namespace Stilla
                 req.Method = "GET";
                 req.Timeout = 15000;
                 req.ReadWriteTimeout = 15000;
-                req.UserAgent = "Stilla/0.1";
+                req.UserAgent = "Stilla/" + AppInfo.Version;
                 req.Accept = "application/json";
                 req.Headers["Authorization"] = "Bearer " + token;
                 req.Headers["anthropic-beta"] = "oauth-2025-04-20";
@@ -312,6 +312,136 @@ namespace Stilla
         }
     }
 
+    // 每个会话现在的状态：~/.claude/sessions/<pid>.json 里 Claude Code 自己写的 status ——
+    //   busy = 在跑（模型思考 / 输出 / 工具执行）、idle = 空闲（这一轮做完了）、waiting = 在等你处理（waitingFor 写等什么：
+    //   dialog open = 权限确认 / 计划审批等弹窗，input needed = 提问，sandbox request = 沙箱请求……）。
+    // 进程已经不在的文件不算（崩溃后文件可能还留着）。每 2 秒重读一次，只读
+    internal static class SessionStatus
+    {
+        public sealed class Info
+        {
+            public string Status = "";
+            public string WaitingFor = "";
+            public int Pid;                 // Claude Code 进程
+            public string Cwd = "";         // 会话所在的文件夹
+            public string Entrypoint = "";  // claude-vscode = VS Code 扩展里开的；cli = 终端里开的
+        }
+
+        private static readonly object gate = new object();
+        private static Dictionary<string, Info> map = new Dictionary<string, Info>();
+        private static DateTime loadedUtc = DateTime.MinValue;
+
+        public static Info Get(string sessionId)
+        {
+            Refresh();
+            lock (gate)
+            {
+                Info i;
+                return sessionId != null && map.TryGetValue(sessionId, out i) ? i : null;
+            }
+        }
+
+        private static bool Alive(int pid, DateTime fileWriteUtc)
+        {
+            try
+            {
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(pid))
+                {
+                    if (p.HasExited)
+                    {
+                        return false;
+                    }
+                    try
+                    {
+                        // 进程编号会被系统重新分配：这个进程是在文件最后一次写入之后才启动的，就不是写这个文件的 Claude Code（崩溃后遗留的文件）
+                        return p.StartTime.ToUniversalTime() <= fileWriteUtc.AddMinutes(1);
+                    }
+                    catch (Exception)
+                    {
+                        return true;        // 读不到启动时间（权限不够）：按活着算
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static void Refresh()
+        {
+            lock (gate)
+            {
+                if (DateTime.UtcNow - loadedUtc < TimeSpan.FromSeconds(2))
+                {
+                    return;
+                }
+                loadedUtc = DateTime.UtcNow;
+            }
+            Dictionary<string, Info> fresh = new Dictionary<string, Info>();
+            try
+            {
+                foreach (string dir in ClaudeRoots.SessionDirs())
+                {
+                    JavaScriptSerializer js = new JavaScriptSerializer();
+                    foreach (string path in Directory.GetFiles(dir, "*.json"))
+                    {
+                        try
+                        {
+                            string text;
+                            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                            {
+                                text = sr.ReadToEnd();
+                            }
+                            Dictionary<string, object> o = js.DeserializeObject(text) as Dictionary<string, object>;
+                            object sid, st, wf, pid;
+                            if (o == null || !o.TryGetValue("sessionId", out sid) || !(sid is string) || !o.TryGetValue("status", out st) || !(st is string))
+                            {
+                                continue;
+                            }
+                            if (o.TryGetValue("pid", out pid) && pid != null && !Alive(Convert.ToInt32(pid, CultureInfo.InvariantCulture), File.GetLastWriteTimeUtc(path)))
+                            {
+                                continue;
+                            }
+                            Info info = new Info();
+                            info.Status = (string)st;
+                            if (o.TryGetValue("waitingFor", out wf) && wf is string)
+                            {
+                                info.WaitingFor = (string)wf;
+                            }
+                            object cwdO, epO;
+                            if (o.TryGetValue("cwd", out cwdO) && cwdO is string)
+                            {
+                                info.Cwd = (string)cwdO;
+                            }
+                            if (o.TryGetValue("entrypoint", out epO) && epO is string)
+                            {
+                                info.Entrypoint = (string)epO;
+                            }
+                            if (pid != null)
+                            {
+                                info.Pid = Convert.ToInt32(pid, CultureInfo.InvariantCulture);
+                            }
+                            fresh[(string)sid] = info;
+                        }
+                        catch (Exception)
+                        {
+                            // 这个文件正在被写入或格式不认识：跳过
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            lock (gate)
+            {
+                map = fresh;
+            }
+        }
+    }
+
     // Claude Code 会话名称（和应用里显示的一致）：~/.claude/sessions/<pid>.json 里的 name。
     // nameSource = user 是你改过的名字，derived 是自动生成的名字。每 30 秒重读一次。
     internal static class SessionNames
@@ -433,6 +563,7 @@ namespace Stilla
             public string Model;
             public string Tier = "";                            // 档位：思考强度 low / medium / high / xhigh / max，开着 Ultracode 的是 ultra，快速模式加 +fast，没标注的是「未标注」
             public long Msgs;                                   // API 消息条数
+            public long Think;                                  // 其中的思考 token
             public DateTime FirstUtc = DateTime.MaxValue;       // 这个 会话 × 模型 × 档位 第一次和最后一次出现（UTC）：按它排先后，看中途什么时候切换的
             public DateTime LastUtc = DateTime.MinValue;
             public long Total;
@@ -474,12 +605,26 @@ namespace Stilla
             AddTokens(tt.Tok, r.In, r.Out, r.CacheWrite - r.CacheWrite1h, r.CacheWrite1h, r.CacheRead);
         }
 
+        // 一个会话最近的一条消息（算消耗速度用）：时间、模型、档位、各类 token
+        public sealed class RecentUse
+        {
+            public DateTime Utc;
+            public string Model = "";
+            public string Tier = "";
+            public readonly long[] Tok = new long[10];
+        }
+
         // 一个会话现在的状态（不分时间段）：最近一次活动、是不是正在写入、缓存什么时候过期。表格排序用
         public sealed class LiveInfo
         {
+            public readonly List<RecentUse> Recent = new List<RecentUse>();     // 最近 3 小时这个会话（含子任务）的每条消息
             public DateTime LastUtc;
             public bool Active;
+            public bool Waiting;                // 在等你处理（Claude Code 的 status == waiting：权限确认 / 提问 / 计划审批等弹窗）
             public DateTime? ExpiryUtc;
+            public long Ctx;                    // 主会话最近一条消息的上下文大小（输入 + 缓存写入 + 缓存读取）
+            public string Model = "";           // 主会话最近一条消息用的模型
+            public int TtlMin;                  // 缓存有效期（分钟）；0 = 不知道
         }
 
         // 模型 × 档位 的合计（档位视图用）。Tier = 思考强度（low / medium / high / xhigh / max），开着 Ultracode 的是 ultra，快速模式后面加 +fast
@@ -498,6 +643,7 @@ namespace Stilla
         {
             public string Label = "";
             public string Range = "";
+            public DateTime From = DateTime.MinValue, To = DateTime.MaxValue;    // 这个时间段的起止（UTC），弹窗按它去读日志
             public long Total;
             public long Input, Output, CacheWrite, CacheRead;
             public readonly List<SessionTotal> Rows = new List<SessionTotal>();
@@ -854,6 +1000,7 @@ namespace Stilla
             Dictionary<string, string> cwdBy = new Dictionary<string, string>();
             Dictionary<string, string> titleBy = new Dictionary<string, string>();
             HashSet<string> active = new HashSet<string>();
+            HashSet<string> waiting = new HashSet<string>();
             foreach (FileState fs in files.Values)
             {
                 if (fs.Title != null && !fs.Sub)
@@ -868,6 +1015,19 @@ namespace Stilla
                 if (now - fs.Mtime < TimeSpan.FromSeconds(ActiveSeconds))
                 {
                     active.Add(fs.Session);
+                }
+                // Claude Code 自己报告的状态：busy = 在跑（包括模型思考 / 工具执行中，这期间记录里没有新内容），waiting = 在等你处理
+                SessionStatus.Info si = SessionStatus.Get(fs.Session);
+                if (si != null)
+                {
+                    if (si.Status == "busy")
+                    {
+                        active.Add(fs.Session);
+                    }
+                    else if (si.Status == "waiting")
+                    {
+                        waiting.Add(fs.Session);
+                    }
                 }
             }
 
@@ -982,19 +1142,59 @@ namespace Stilla
 
             // 每个会话最近一次活动（任何消息，包括子任务）、是否正在写入、缓存到期时间：面板排序用
             Dictionary<string, DateTime> lastBy = new Dictionary<string, DateTime>();
+            Dictionary<string, Rec> lastMain = new Dictionary<string, Rec>();
+            Dictionary<string, List<RecentUse>> recentBy = new Dictionary<string, List<RecentUse>>();
             foreach (Rec r in recs.Values)
             {
+                if (now - r.Utc <= TimeSpan.FromMinutes(180))
+                {
+                    List<RecentUse> rl;
+                    if (!recentBy.TryGetValue(r.Session, out rl))
+                    {
+                        rl = new List<RecentUse>();
+                        recentBy[r.Session] = rl;
+                    }
+                    RecentUse ru = new RecentUse();
+                    ru.Utc = r.Utc;
+                    ru.Model = r.Model;
+                    ru.Tier = TagStore.TierKey(TagStore.Get(r.Id) ?? TagStore.FromRec(r));
+                    AddTokens(ru.Tok, r.In, r.Out, r.CacheWrite - r.CacheWrite1h, r.CacheWrite1h, r.CacheRead);
+                    rl.Add(ru);
+                }
                 DateTime lastSeen;
                 if (!lastBy.TryGetValue(r.Session, out lastSeen) || r.Utc > lastSeen)
                 {
                     lastBy[r.Session] = r.Utc;
+                }
+                Rec lm;
+                if (r.Agent == null && (!lastMain.TryGetValue(r.Session, out lm) || r.Utc > lm.Utc))
+                {
+                    lastMain[r.Session] = r;
                 }
             }
             foreach (KeyValuePair<string, DateTime> kv in lastBy)
             {
                 LiveInfo liveInfo = new LiveInfo();
                 liveInfo.LastUtc = kv.Value;
-                liveInfo.Active = active.Contains(kv.Key);
+                liveInfo.Waiting = waiting.Contains(kv.Key);
+                liveInfo.Active = active.Contains(kv.Key) && !liveInfo.Waiting;
+                List<RecentUse> recentList;
+                if (recentBy.TryGetValue(kv.Key, out recentList))
+                {
+                    recentList.Sort(delegate(RecentUse a, RecentUse b) { return a.Utc.CompareTo(b.Utc); });
+                    liveInfo.Recent.AddRange(recentList);
+                }
+                Rec mainRec;
+                if (lastMain.TryGetValue(kv.Key, out mainRec))
+                {
+                    liveInfo.Ctx = mainRec.In + mainRec.CacheRead + mainRec.CacheWrite;
+                    liveInfo.Model = mainRec.Model;
+                }
+                int ttlMin;
+                if (ttlBy.TryGetValue(kv.Key, out ttlMin))
+                {
+                    liveInfo.TtlMin = ttlMin;
+                }
                 DateTime expUtc;
                 if (expiryBy.TryGetValue(kv.Key, out expUtc))
                 {
@@ -1021,6 +1221,8 @@ namespace Stilla
         // 汇总 [from, to) 时间段内的记录，按会话分组
         private void FillPeriod(PeriodSummary p, DateTime from, DateTime to, Dictionary<string, string> cwdBy, Dictionary<string, string> titleBy, HashSet<string> active)
         {
+            p.From = from;
+            p.To = to;
             Dictionary<string, SessionTotal> map = new Dictionary<string, SessionTotal>();
             Dictionary<string, HashSet<string>> agents = new Dictionary<string, HashSet<string>>();
             Dictionary<string, ModelTotal> byModel = new Dictionary<string, ModelTotal>();
@@ -1032,7 +1234,8 @@ namespace Stilla
                     continue;
                 }
                 long all = r.In + r.Out + r.CacheWrite + r.CacheRead;
-                string tierK = TagStore.TierKey(TagStore.Get(r.Id) ?? TagStore.FromRec(r));
+                TagStore.Tag tg0 = TagStore.Get(r.Id) ?? TagStore.FromRec(r);
+                string tierK = TagStore.TierKey(tg0);
                 string mkey = r.Session + "\n" + r.Model + "\n" + tierK;
                 ModelTotal mt;
                 if (!byModel.TryGetValue(mkey, out mt))
@@ -1044,6 +1247,7 @@ namespace Stilla
                     byModel[mkey] = mt;
                 }
                 mt.Msgs++;
+                mt.Think += tg0.Think;
                 if (r.Utc < mt.FirstUtc)
                 {
                     mt.FirstUtc = r.Utc;
@@ -1380,6 +1584,7 @@ namespace Stilla
         private DateTime lastQuotaUtc = DateTime.MinValue;
 
         public bool Enabled = true;
+        public volatile bool Paused;        // 「暂停后台读取」开着时这一轮不读会话记录（打游戏用）；恢复后下一轮自动补上
 
         public string DetailPath
         {
@@ -1437,7 +1642,7 @@ namespace Stilla
 
         private void OnTimer(object state)
         {
-            if (!Enabled || Interlocked.CompareExchange(ref busy, 1, 0) != 0)
+            if (!Enabled || Paused || Interlocked.CompareExchange(ref busy, 1, 0) != 0)
             {
                 return;
             }
@@ -2373,6 +2578,7 @@ namespace Stilla
         public double ReadScale = 1;                           // 缓存读取单价的缩放（拟合出来的，1 = 官方价格）
         public double CalibErr = -1;                           // 额度换算的「事前预测」误差：每一块数据用它之前的数据拟合再预测，平均相对误差；-1 = 没有
         public int CalibBlocks;                                // 参与的块数
+        public bool PlanDerived;                               // 当前口径自己的数据还不够拟合，系数是按套餐倍率从别的口径推算的（可能差好几倍，速度前面标「≈」）
         public bool Stale;                                     // 文件里还没有当前账号 / 计划的结果：只留价格表（订阅视图折算金额用），系数一律不用（显示「—」），别拿另一个账号的系数硬套
 
         // key = 当前的「口径」（账号:计划，例如 B:pro）。额度换算.py 给每个口径各写一组行（最后一列），当前口径写在最后；
@@ -2423,6 +2629,7 @@ namespace Stilla
                 }
                 if (f[0] == "全局")
                 {
+                    t.PlanDerived = f[11].StartsWith("按套餐倍率推算", StringComparison.Ordinal);
                     double scale, err;
                     int blocks;
                     if (f.Length > 16 && double.TryParse(f[16], NumberStyles.Float, CultureInfo.InvariantCulture, out scale) && scale > 0)
@@ -2454,7 +2661,7 @@ namespace Stilla
                 bool ok = true;
                 for (int i = 0; i < 5; i++)
                 {
-                    ok = ok && double.TryParse(f[2 + i], NumberStyles.Float, CultureInfo.InvariantCulture, out e.Price[i]);
+                    ok = ok && double.TryParse(f[2 + i], NumberStyles.Float, CultureInfo.InvariantCulture, out e.Price[i]) && !double.IsNaN(e.Price[i]) && !double.IsInfinity(e.Price[i]) && e.Price[i] >= 0;
                 }
                 if (!ok)
                 {
@@ -2462,6 +2669,14 @@ namespace Stilla
                 }
                 double.TryParse(f[7], NumberStyles.Float, CultureInfo.InvariantCulture, out e.K5);
                 double.TryParse(f[9], NumberStyles.Float, CultureInfo.InvariantCulture, out e.KW);
+                if (double.IsNaN(e.K5) || double.IsInfinity(e.K5) || e.K5 < 0)
+                {
+                    e.K5 = 0;
+                }
+                if (double.IsNaN(e.KW) || double.IsInfinity(e.KW) || e.KW < 0)
+                {
+                    e.KW = 0;
+                }
                 if (t.Stale)
                 {
                     e.K5 = 0;
@@ -2531,6 +2746,8 @@ namespace Stilla
             {
                 res[k] = new UsageTracker.PeriodSummary();
                 res[k].Label = labels[k];
+                res[k].From = froms[k].ToUniversalTime();
+                res[k].To = tos[k].Year >= 9999 ? DateTime.MaxValue : tos[k].ToUniversalTime();
                 res[k].Range = froms[k].ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) + " ~ " + tos[k].ToString("MM-dd HH:mm", CultureInfo.InvariantCulture);
                 sessions[k] = new Dictionary<string, UsageTracker.SessionTotal>();
                 models[k] = new Dictionary<string, UsageTracker.ModelTotal>();
@@ -2595,6 +2812,177 @@ namespace Stilla
             return res;
         }
 
+        public static string[] SplitCsv(string line)
+        {
+            return ParseCsv(line);
+        }
+
+        public static long ToLong(string s)
+        {
+            return Num(s);
+        }
+
+        // 一个会话在 [fromUtc, toUtc) 里的切换记录：主会话的消息按时间先后，连续的同一个 模型+档位 合成一段；
+        // 子任务（子智能体 / workflow）的消息和主会话交错，单独按 模型+档位 各合成一行（Sub = true），排在后面
+        public static List<SessionRun> ReadRuns(string detailPath, string session, DateTime fromUtc, DateTime toUtc)
+        {
+            List<SessionRun> result = new List<SessionRun>();
+            if (!File.Exists(detailPath) || string.IsNullOrEmpty(session))
+            {
+                return result;
+            }
+            TagStore.Refresh();
+            DateTime from = fromUtc.Year <= 1 ? DateTime.MinValue : fromUtc.ToLocalTime();
+            DateTime to = toUtc.Year >= 9999 ? DateTime.MaxValue : toUtc.ToLocalTime();
+            List<KeyValuePair<DateTime, string[]>> msgs = new List<KeyValuePair<DateTime, string[]>>();
+            using (FileStream fs = new FileStream(detailPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    if (line.IndexOf(session, StringComparison.Ordinal) < 0)
+                    {
+                        continue;
+                    }
+                    int comma = line.IndexOf(',');
+                    DateTime t;
+                    if (comma <= 0 || !DateTime.TryParseExact(line.Substring(0, comma), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    if (t < from || t >= to)
+                    {
+                        continue;
+                    }
+                    string[] f = ParseCsv(line);
+                    if (f.Length >= 11 && f[1] == session)
+                    {
+                        msgs.Add(new KeyValuePair<DateTime, string[]>(t, f));
+                    }
+                }
+            }
+            msgs.Sort(delegate(KeyValuePair<DateTime, string[]> a, KeyValuePair<DateTime, string[]> b) { return a.Key.CompareTo(b.Key); });
+            SessionRun cur = null;
+            Dictionary<string, SessionRun> subs = new Dictionary<string, SessionRun>();
+            foreach (KeyValuePair<DateTime, string[]> m in msgs)
+            {
+                string[] f = m.Value;
+                string model = f[3];
+                if (model.Length == 0 || model.StartsWith("<", StringComparison.Ordinal))
+                {
+                    continue;       // <synthetic> 之类没有用量的占位消息
+                }
+                string tier = TagStore.TierKey(TagStore.Get(f[10]));
+                bool sub = f[9] == "1";
+                SessionRun r;
+                if (sub)
+                {
+                    string key = model + "\n" + tier;
+                    if (!subs.TryGetValue(key, out r))
+                    {
+                        r = new SessionRun();
+                        r.Model = model;
+                        r.Tier = tier;
+                        r.Sub = true;
+                        subs[key] = r;
+                    }
+                }
+                else
+                {
+                    if (cur == null || cur.Model != model || cur.Tier != tier)
+                    {
+                        cur = new SessionRun();
+                        cur.Model = model;
+                        cur.Tier = tier;
+                        result.Add(cur);
+                    }
+                    r = cur;
+                }
+                TagStore.Tag tag = TagStore.Get(f[10]);
+                long inp = Num(f[4]), outp = Num(f[5]), cw1 = Num(f[7]), cw5 = Num(f[6]), cr = Num(f[8]);
+                UsageTracker.AddTokens(r.Tok, inp, outp, cw5, cw1, cr);
+                r.Msgs++;
+                r.Think += tag == null ? 0 : tag.Think;
+                if (m.Key < r.First)
+                {
+                    r.First = m.Key;
+                }
+                if (m.Key > r.Last)
+                {
+                    r.Last = m.Key;
+                }
+            }
+            List<SessionRun> subList = new List<SessionRun>(subs.Values);
+            subList.Sort(delegate(SessionRun a, SessionRun b) { return a.First.CompareTo(b.First); });
+            result.AddRange(subList);
+            return result;
+        }
+
+        // 走 API 的非 Claude 模型（例如 DeepSeek）的全部历史用量：按模型汇总，不分时间段
+        public sealed class ApiTotal
+        {
+            public string Model = "";
+            public long Msgs, In, Out, Cw, Cr;
+            public DateTime First = DateTime.MaxValue, Last = DateTime.MinValue;
+        }
+
+        public static List<ApiTotal> ReadApiTotals(string detailPath)
+        {
+            Dictionary<string, ApiTotal> map = new Dictionary<string, ApiTotal>();
+            if (!File.Exists(detailPath))
+            {
+                return new List<ApiTotal>();
+            }
+            using (FileStream fs = new FileStream(detailPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    int comma = line.IndexOf(',');
+                    DateTime t;
+                    if (comma <= 0 || !DateTime.TryParseExact(line.Substring(0, comma), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    string[] f = ParseCsv(line);
+                    if (f.Length < 11)
+                    {
+                        continue;
+                    }
+                    string model = System.Text.RegularExpressions.Regex.Replace(f[3] ?? "", @"-\d{8}$", "");
+                    if (model.Length == 0 || model.StartsWith("claude", StringComparison.OrdinalIgnoreCase) || model.StartsWith("<", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    ApiTotal a;
+                    if (!map.TryGetValue(model, out a))
+                    {
+                        a = new ApiTotal();
+                        a.Model = model;
+                        map[model] = a;
+                    }
+                    a.Msgs++;
+                    a.In += Num(f[4]);
+                    a.Out += Num(f[5]);
+                    a.Cw += Num(f[6]) + Num(f[7]);
+                    a.Cr += Num(f[8]);
+                    if (t < a.First)
+                    {
+                        a.First = t;
+                    }
+                    if (t > a.Last)
+                    {
+                        a.Last = t;
+                    }
+                }
+            }
+            List<ApiTotal> list = new List<ApiTotal>(map.Values);
+            list.Sort(delegate(ApiTotal a, ApiTotal b) { return b.Last.CompareTo(a.Last); });
+            return list;
+        }
+
         private static void Add(UsageTracker.PeriodSummary p, Dictionary<string, UsageTracker.SessionTotal> sessions,
             Dictionary<string, UsageTracker.ModelTotal> models, Dictionary<string, UsageTracker.TierTotal> tiers, TagStore.Tag tag,
             string[] f, long inp, long outp, long cw, long cr, Dictionary<string, string> indexTitles, DateTime when)
@@ -2634,6 +3022,7 @@ namespace Stilla
                 models[mkey] = mt;
             }
             mt.Msgs++;
+            mt.Think += tag == null ? 0 : tag.Think;
             if (whenUtc < mt.FirstUtc)
             {
                 mt.FirstUtc = whenUtc;
@@ -2799,6 +3188,7 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(360, 250);
 
             Label tip = new Label();
@@ -2869,7 +3259,8 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(360, 200);
+            DialogDpi.Apply(this);
+            ClientSize = new Size(400, 200);
 
             Label lf = new Label();
             lf.Text = "开始";
@@ -2891,8 +3282,8 @@ namespace Stilla
             {
                 Button b = new Button();
                 b.Text = presets[i];
-                b.Size = new Size(64, 26);
-                b.Location = new Point(16 + i * 68, 96);
+                b.Size = new Size(72, 26);
+                b.Location = new Point(16 + i * 76, 96);
                 int which = i;
                 b.Click += delegate { ApplyPreset(which); };
                 Controls.Add(b);
@@ -2979,6 +3370,7 @@ namespace Stilla
             Text = "会话明细 · " + title;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(680, 440);
 
             list = new ListView();
@@ -3185,7 +3577,7 @@ namespace Stilla
 
     // 悬浮窗本体。用「逐像素 alpha 的分层窗口」自己合成画面：
     // 背景（圆角底板+边框）和前景（文字+进度条）各自带各自的透明度，互不影响。
-    internal sealed class Widget : Form
+    internal sealed partial class Widget : Form
     {
         private const int BaseW = 264;
         private const int PollSeconds = 60;
@@ -3293,11 +3685,10 @@ namespace Stilla
         private const int ToggleBarH = 22;      // 紧凑卡和用量面板之间那条「简洁 / 详细」切换栏的高度（基础尺寸，未乘缩放）
         private RectangleF toggleRect;          // 切换按钮的位置（点击在简洁模式和详细模式之间切换）
         private ToolStripMenuItem usageMenuItem;   // 右键菜单里的「显示用量统计」，用切换栏改了状态后要同步勾选
-        private bool showDeepSeek;              // 面板最下面的「DeepSeek 闲时价估算」行：默认不显示（这是个很个人的功能，设置 ds=1 或右键菜单里打开）
         private UsageTracker usage;
         private UsageTracker.Snapshot usageSnap = new UsageTracker.Snapshot();
-        private const int UsageW = 420;         // 打开用量统计时的窗口宽度（会话表格要放下缓存剩余时间和四列数字）
-        private const int UsagePanelH = 288;    // 面板高度（基础尺寸，未乘缩放）：表头和液面杯 146 + 6 行 × 16 + 合计和费用 36
+        private const int UsageW = 600;         // 打开用量统计时的窗口宽度（会话表格要放下缓存剩余、速度、四列数字和成本）
+        private const int UsagePanelH = 304;    // 面板高度（基础尺寸，未乘缩放）：表头和液面杯 146 + 6 行 × 16 + 合计、触顶预测和费用 52
         private const int DiagramH = 130;       // 墨滴双圆的高度（基础尺寸，未乘缩放）
         private bool rowsExpanded;              // 点了「其他 N 个」：展开全部会话（窗口会按需要长高）
         private int rowScroll;                  // 展开后窗口放不下时，滚轮翻到第几行
@@ -3322,8 +3713,8 @@ namespace Stilla
         private UsageLogger logger;             // 用量日志：明细和额度快照写进「日志」文件夹
         private NotifyIcon tray;                // 托盘图标：关窗口时缩到托盘，托盘菜单里的「退出」才真正结束
         private bool exitRequested;
-        private int usageMode;                  // 面板视图：0 = 会话，1 = 模型，2 = 对比，3 = 档位，4 = 订阅
-        private readonly RectangleF[] segRects = new RectangleF[5];   // 表头五个视图按钮（会话 / 模型 / 对比 / 档位 / 订阅）的位置
+        private int usageMode;                  // 面板视图：0 = 会话，1 = 模型，2 = 对比（模型 × 档位），3 = 订阅，4 = API
+        private readonly RectangleF[] segRects = new RectangleF[6];   // 表头六个视图按钮（会话 / 模型 / 对比 / 订阅 / API / 趋势）的位置，没显示的是空矩形
         private QuotaTable quota;                                  // 额度换算表（日志\额度换算.csv），没有文件时为 null
         private DateTime quotaReadUtc = DateTime.MinValue;
         private DateTime quotaFitUtc = DateTime.MinValue;          // 上一次在后台重算额度换算的时间
@@ -3347,16 +3738,59 @@ namespace Stilla
             public long Reset;
         }
         private DateTime vsyncUtc = DateTime.MinValue;   // 上一次导出 VS Code 标题的时间
-        private readonly double[] colFr = { 0.40, 0.12, 0.12, 0.12, 0.12, 0.12 };   // 列宽比例：会话名、缓存剩余、输入、输出、缓存写入、缓存读取（和为 1，可以拖动调整）
-        private readonly float[] colWidth = new float[6];   // 本次绘制时各列的宽度（物理像素）
-        private readonly float[] colEdgeX = new float[5];   // 各列分隔线的位置
+        // 列宽比例（和为 1，可以拖动调整）：0 名字、1 缓存剩余、2 速度、3~6 四列数字（会话视图是 输入 / 输出 / 缓存写 / 缓存读）。
+        // 别的视图没有缓存剩余 / 速度这两列时，名字栏占它们的位置，或者拿它们放第 5 列数字（对比视图）
+        // 第 7 列只有会话视图有：成本（这个会话按官方价格算的 API 等价金额）。隐藏的列宽度是 0
+        private readonly double[] colFr = { 0.28, 0.11, 0.13, 0.12, 0.12, 0.12, 0.12, 0.12 };
+        private readonly float[] colWidth = new float[8];   // 本次绘制时各列的宽度（物理像素）
+        private readonly float[] colEdgeX = new float[7];   // 各列右边的分隔线的位置
+        private readonly bool[] colOn = new bool[8];        // 本次绘制时各列显不显示
+        private readonly int[] colNext = new int[8];        // 每列右边下一个显示的列（没有 = -1），拖分隔线时和它互相让宽度
         private float colInner = 1f;
         private float colTop, colBottom;
         private int colDrag = -1;                           // 正在拖动第几条分隔线（-1 = 没有）
         private int colDragX0;
-        private readonly double[] colDragStart = new double[6];
-        private readonly HashSet<string> expandedGroups = new HashSet<string>();     // 模型视图里展开了的会话（会话 ID）
-        private readonly List<KeyValuePair<RectangleF, string>> chevHits = new List<KeyValuePair<RectangleF, string>>();   // 模型视图里 ▸ 的位置（点击展开 / 折叠）
+        private readonly double[] colDragStart = new double[8];
+        private readonly List<KeyValuePair<RectangleF, int>> headHits = new List<KeyValuePair<RectangleF, int>>();   // 表头每一格的位置（点击排序）
+        private RectangleF speedHeadRect = RectangleF.Empty;    // 会话视图「速度」表头（点击选统计窗口：5 / 15 / 30 / 60 分钟或自定义）
+        private int speedMin = 15;                              // 速度统计窗口（分钟）
+        private readonly int[] sortCol = { -1, -1, -1 };        // 会话 / 模型 / 对比 三个视图各自的排序列（-1 = 默认顺序）
+        private readonly bool[] sortDesc = { true, true, true };
+        private int legacyMode = -1;                            // 旧设置里的 mode=（视图编号变过，没有 view= 时要换算）
+        private bool sawView;
+        private Dictionary<string, SpeedInfo> speedBy;          // 会话 → 近 speedMin 分钟的消耗速度（会话视图每次重绘时算）
+
+        private sealed class SpeedInfo
+        {
+            public double R5, Rw;       // 5 小时额度 / 每周额度的消耗速度（%/小时）
+            public double P5, Pw;       // 窗口里一共占用的 5 小时 / 每周额度（百分点）= 速度 × 窗口小时数（「占用」列）
+            public double GP5, GPw;     // 灰色：它最后一次活跃时、同样长度窗口里的占用
+            public bool Known;          // 有额度换算系数、这段时间里有用量
+            public bool GrayDone, HasGray;
+            public double G5, Gw;       // 这段时间里没有用量时：它「过去活动时」的平均速度（窗口取到它最后一次活动为止），灰色显示
+        }
+
+        private Dictionary<string, List<UsageTracker.RecentUse>> speedHist;     // 从日志读的最近 8 天每个会话的每条消息（速度窗口超过 3 小时、或算闲下来的会话的平均速度用）
+        private DateTime speedHistUtc = DateTime.MinValue;
+        private bool speedHistBusy;
+        private DateTime speedNowUtc = DateTime.UtcNow;
+        private readonly List<KeyValuePair<RectangleF, UsageTracker.SessionTotal>> jumpHits = new List<KeyValuePair<RectangleF, UsageTracker.SessionTotal>>();   // 会话行名字右边的 ↗（点击跳转到会话窗口）
+
+        private bool speedApprox;       // 速度里有按「官方价格 / 套餐倍率推算」的成分（额度换算里标「≈」的）
+        // 缓存提醒：会话缓存的状态颜色、系统通知、托盘图标和卡片上的状态点
+        private bool alertsOn = true;                   // 缓存快过期时弹系统通知（设置 alert=）
+        private DateTime lastBgUsageUtc = DateTime.MinValue;
+        private readonly Dictionary<string, double> cacheRem = new Dictionary<string, double>();   // 会话 → 上一次看到的缓存剩余分钟（判断是不是刚刚掉到 10 分钟以内）
+        private int indicatorKey = -1;
+        private CacheState indicatorState = CacheState.None;
+        private int cUrgent, cSoon, cRunning, cWaiting;
+        private int trayDotKey = -1;
+        private IntPtr trayDotHandle = IntPtr.Zero;
+        private DetailPopup tierPopup;                  // 模型视图里点会话弹出的详情小窗
+        private string tierPopupSession = "";
+        private List<LogSummary.ApiTotal> apiRows;      // API 视图的数据（走 API 的非 Claude 模型的全部历史用量）
+        private DateTime apiRefreshUtc = DateTime.MinValue;
+        private bool apiBusy;
         private readonly List<KeyValuePair<RectangleF, string>> sessionHits = new List<KeyValuePair<RectangleF, string>>();   // 用量面板里每个会话行的位置（点击钻取）
         private int winWu, winHu;               // 用户拖动调整后的窗口大小（基础单位）；0 = 用默认大小
         private bool resizing;                  // 正在拖动边缘调整大小
@@ -3611,12 +4045,13 @@ namespace Stilla
             }
 
             // 倒计时精确到分钟：界面上的文字没变就不重绘，空闲时几乎不占 CPU
-            if (DateTime.UtcNow - vsyncUtc > TimeSpan.FromMinutes(10))
+            if (Has(Feat.VSync) && !paused && DateTime.UtcNow - vsyncUtc > TimeSpan.FromMinutes(10))
             {
                 vsyncUtc = DateTime.UtcNow;
                 StartVsCodeSync();
             }
-            if (DateTime.UtcNow - quotaFitUtc > TimeSpan.FromHours(1))
+            // 每小时重算一次额度换算；当前口径自己的数据还不够、系数是推算的时候，每 10 分钟重算一次（数据一够就换成实测的）
+            if (Has(Feat.Fit) && !paused && DateTime.UtcNow - quotaFitUtc > TimeSpan.FromMinutes((quota != null && (quota.PlanDerived || quota.Stale)) ? Cad().FitDerivedMin : Cad().FitMin))
             {
                 quotaFitUtc = DateTime.UtcNow;
                 StartQuotaFit();
@@ -3630,13 +4065,36 @@ namespace Stilla
             {
                 // 账号识别出任何问题都不能影响额度显示
             }
+            TrimMemoryIfBig();
+            try
+            {
+                CheckWeeklyReport();
+            }
+            catch (Exception)
+            {
+            }
             RefreshUsage();
-            if (showUsage)
+            try
+            {
+                UpdateCacheIndicators();
+            }
+            catch (Exception)
+            {
+            }
+            if (showUsage && !paused)
             {
                 StartLogRefresh();
-                if (usageMode == 4)
+                if (usageMode == 0 || usageMode == 5)
+                {
+                    StartSpeedHistory();
+                }
+                if (usageMode == 3)
                 {
                     StartSubRefresh();
+                }
+                if (usageMode == 4)
+                {
+                    StartApiRefresh();
                 }
             }
             CheckRedraw();
@@ -3966,6 +4424,7 @@ namespace Stilla
             Quota five = data == null ? null : data.FiveHour;
             Quota week = data == null ? null : data.SevenDay;
 
+            tipHits.Clear();
             closeRect = new RectangleF(w - pad - 18f * s, 6f * s, 24f * s, 22f * s);
             refreshRect = new RectangleF(closeRect.X - 40f * s, 6f * s, 38f * s, 22f * s);
 
@@ -4025,6 +4484,10 @@ namespace Stilla
             if (showUsage)
             {
                 DrawUsagePanel(g, w, h);
+            }
+            if (tipsOn)
+            {
+                BuildTips(w, h);        // 悬停说明：这一帧里每块区域对应哪段说明（Tips.cs）
             }
         }
 
@@ -4098,9 +4561,10 @@ namespace Stilla
 
             skin.DrawFrame(g, new RectangleF(0f, top, w, UsagePanelH * s), curPal, s);
 
-            // 表头：墨滴图标 + USAGE，右边是三个视图按钮
+            // 表头：墨滴图标 + USAGE，右边是视图按钮
             skin.DrawTitle(g, pad, top + 6f * s, "USAGE", FontsNow(), curPal, s);
             DrawModeSwitch(g, w, pad, top + 7f * s, s);
+            DrawPauseNote(g, pad, top, s);
 
             // 时间标签（液面杯），再是大号数字和时间范围
             DrawTabStrip(g, shownTabs, pad, top + 34f * s, inner, s);
@@ -4108,85 +4572,176 @@ namespace Stilla
             DrawTextRect(g, UsageTracker.FormatTokens(cur.Total), fBig, TextMain, new RectangleF(pad, top + 98f * s, inner * 0.4f, 26f * s), StringAlignment.Near);
             DrawTextRect(g, "TOKENS · " + cur.Range, fSmall, TextDim, new RectangleF(pad + inner * 0.4f, top + 104f * s, inner * 0.6f, 16f * s), StringAlignment.Far);
 
-            // 列：会话名（左）| 缓存剩余（中）| 输入 输出 缓存写 缓存读（右）
             sessionHits.Clear();
-            // 列宽按比例分配（可以在卡片里拖动分隔线调整）：会话名 | 缓存剩余 | 输入 | 输出 | 缓存写入 | 缓存读取
-            // 每列先保证最小宽度（窗口缩窄后也不会把数字挤没），剩下的宽度再按比例分配
-            double frSum = 0;
-            for (int i = 0; i < 6; i++)
+            headHits.Clear();
+            jumpHits.Clear();
+            speedHeadRect = RectangleF.Empty;
+            occHeadRect = RectangleF.Empty;
+            gripRect = RectangleF.Empty;
+            healthRect = RectangleF.Empty;
+            mailBtnRect = RectangleF.Empty;
+            tipForecast = RectangleF.Empty;
+            tipDs = RectangleF.Empty;
+            tipYTotal = -1f;
+            tipRowsN = 0;
+            tipRowsOther = false;
+            tipInfoY = -1f;
+            tipInfoN = 0;
+            if (usageMode == 5)
             {
-                frSum += colFr[i];
+                moreRect = RectangleF.Empty;
+                speedBy = null;
+                DrawTrendView(g, pad, inner, s, top);
+                return;
             }
-            float[] mins = { 120f * s, 56f * s, 44f * s, 44f * s, 44f * s, 44f * s };
-            float minSum = 0;
-            for (int i = 0; i < 6; i++)
+            // 列宽按比例分配（可以在卡片里拖动分隔线调整）：名字 | 缓存剩余 | 速度 | 四列数字
+            // 每列先保证最小宽度（窗口缩窄后也不会把数字挤没），剩下的宽度再按比例分配
+            // 会话视图的列可以在设置里隐藏（smask）；第 7 列（成本）只有会话视图有。隐藏的列宽度为 0，宽度让给别的列
+            for (int i = 0; i < 8; i++)
             {
-                minSum += mins[i];
+                colOn[i] = usageMode == 0 ? (i == 0 || (smask & (1 << ColBitOf[i])) != 0) : i < 7;
+            }
+            float[] mins = usageMode == 0 ? new float[] { 120f * s, 64f * s, 70f * s, 78f * s, 52f * s, 52f * s, 52f * s, 52f * s }
+                : new float[] { 120f * s, 64f * s, 70f * s, 52f * s, 52f * s, 52f * s, 52f * s, 56f * s };
+            // the header text plus the sort caret must always fit (no "Cache le..."): every column is at least as wide as its header
+            int headFrom = usageMode == 0 ? 1 : usageMode == 2 ? 2 : 3;
+            float headGw = usageMode <= 2 ? 14f * s : 0f;
+            for (int i = headFrom; i < 8; i++)
+            {
+                if (colOn[i])
+                {
+                    mins[i] = Math.Max(mins[i], TextW(g, HeadText(usageMode, i), fSmall) + headGw + 3f * s);
+                }
+            }
+            float minSum = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                minSum += colOn[i] ? mins[i] : 0;
+            }
+            if (usageMode == 0)
+            {
+                // window too narrow for all columns: hide the least important ones for this frame (the settings stay as they are, they come back when the window is widened): input, cache write, cache read, share, output, speed
+                int[] dropOrder = { 4, 6, 7, 3, 5, 2 };
+                foreach (int dc in dropOrder)
+                {
+                    if (minSum <= inner + 0.5f)
+                    {
+                        break;
+                    }
+                    if (colOn[dc])
+                    {
+                        colOn[dc] = false;
+                        minSum -= mins[dc];
+                    }
+                }
+            }
+            double frSum = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                frSum += colOn[i] ? colFr[i] : 0;
             }
             float shrink = minSum > inner ? inner / minSum : 1f;
             float remain = inner - minSum * shrink;
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 8; i++)
             {
-                colWidth[i] = mins[i] * shrink + remain * (float)(colFr[i] / frSum);
+                colWidth[i] = colOn[i] ? mins[i] * shrink + remain * (float)(colFr[i] / frSum) : 0f;
             }
             colInner = inner;
             float edgeX = pad;
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < 7; i++)
             {
                 edgeX += colWidth[i];
                 colEdgeX[i] = edgeX;
             }
-            colTop = top + 128f * s;
-            colBottom = top + UsagePanelH * s;
-            using (Pen divPen = new Pen(Track))
+            for (int i = 0; i < 8; i++)
             {
-                for (int i = usageMode == 0 ? 0 : 1; i < (usageMode == 4 ? 0 : 5); i++)
+                colNext[i] = -1;
+                for (int j = i + 1; j < 8; j++)
                 {
-                    g.DrawLine(divPen, colEdgeX[i], colTop, colEdgeX[i], colBottom);
+                    if (colOn[j])
+                    {
+                        colNext[i] = j;
+                        break;
+                    }
                 }
             }
+            colTop = top + 128f * s;
+            colBottom = top + UsagePanelH * s;
             float nameW = colWidth[0];
             float cacheW = colWidth[1];
-            float colW = colWidth[2];
+            float extraW = colWidth[2];
+            float colW = colWidth[3];
             float headY = top + 128f * s;
-            float rowH = 16f * s;
-            string[] heads = usageMode == 0 ? new string[] { "输入", "输出", "缓存写", "缓存读" }
-                : usageMode == 1 ? new string[] { "token", "5h估算", "周估算", "缓存读" }
-                : usageMode == 3 ? new string[] { "条数", "输出", "思考", "5h估算" }
-                : usageMode == 4 ? new string[] { "本期用量", "月费", "回本", "续费" }
-                : new string[] { "token", "占比", "5h估算", "倍数" };
-            DrawTextRect(g, usageMode == 0 ? "会话" : usageMode == 1 ? "模型" : usageMode == 3 ? "档位" : usageMode == 4 ? "账号" : "对比", fSmall, TextDim, new RectangleF(pad, headY, nameW, 14f * s), StringAlignment.Near);
+            float rowH = rowHu * s;          // 行高可以拖「合计」上面的分隔线调整
+
+            // 会话视图的消耗速度（近 speedMin 分钟，按额度换算折成 %/小时）
+            double tot5 = 0, totW = 0;
+            bool speedKnown = false;
+            speedBy = null;
             if (usageMode == 0)
             {
-                DrawTextRect(g, "缓存剩余", fSmall, TextDim, new RectangleF(pad + nameW, headY, cacheW, 14f * s), StringAlignment.Far);
+                LoadQuota();
+                speedBy = ComputeSpeeds(DateTime.UtcNow, out tot5, out totW, out speedKnown);
+                tipTot5 = tot5;
+                tipTotW = totW;
+                tipSpeedKnown = speedKnown;
             }
-            DrawRowNumbers(g, pad, inner, colW, headY, 14f * s, heads, TextDim);
 
-            // 当前窗口高度能放下几行（底下还要留合计和费用两行）；窗口拉高了就多显示
+            // 当前窗口高度能放下几行（底下还要留合计、触顶预测和费用）；窗口拉高了就多显示
             float panelH = h / s - CompactH();
-            int capacity = (int)Math.Floor((panelH - 182f) / 16f);
-            int cap = Math.Max(1, capacity - (usageMode == 4 ? 1 : 0));
+            // 表头和液面杯占 150；下面还有 2~3 行（合计、触顶预测、费用）也按行高算
+            int cap = Math.Max(1, (int)Math.Floor((panelH - 150f) / rowHu) - (usageMode == 0 || usageMode >= 3 ? 3 : 2));
 
             moreRect = RectangleF.Empty;
-            List<UsageTracker.SessionTotal> rows = SortedSessions(cur);
+            List<UsageTracker.SessionTotal> rows = usageMode == 0 ? SortedSessions(cur) : new List<UsageTracker.SessionTotal>();
+            if (usageMode == 0 && sortCol[0] >= 0)
+            {
+                ApplySessionSort(rows);
+            }
             float y = top + 146f * s;
+            // column dividers and headers: in the session view the dividers stop at the total row, the forecast / health / cost lines below are full-width text
+            float divBottom = colBottom;
+            if (usageMode == 0)
+            {
+                int shown0 = 1;
+                if (rows.Count > 0)
+                {
+                    int start0;
+                    bool more0, collapse0;
+                    RowWindow(rows.Count, cap, out start0, out shown0, out more0, out collapse0);
+                    shown0 += more0 || collapse0 ? 1 : 0;
+                }
+                divBottom = Math.Min(h - 4f * s, y + shown0 * rowH + 3f * s + rowH + 1f * s);
+            }
+            DrawDividers(g, divBottom);
+            DrawColumnHeaders(g, pad, headY, s);
             int drawn = 0;
             if (usageMode == 1)
             {
-                drawn = DrawModelRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                drawn = DrawModelRows(g, cur, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
             }
             else if (usageMode == 2)
             {
-                drawn = DrawCompareRows(g, cur, pad, inner, s, colW, nameW, y, rowH, cap);
+                drawn = DrawCompareRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
             }
             else if (usageMode == 3)
             {
-                drawn = DrawTierRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                drawn = DrawSubscriptionRows(g, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
+                DrawRowGrip(g, pad, inner, s, y + drawn * rowH + 1.5f * s, drawn, true);
+                DrawSubscriptionInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
+                return;
             }
             else if (usageMode == 4)
             {
-                drawn = DrawSubscriptionRows(g, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
-                DrawSubscriptionInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
+                drawn = DrawApiRows(g, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
+                DrawRowGrip(g, pad, inner, s, y + drawn * rowH + 1.5f * s, drawn, true);
+                DrawApiInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
                 return;
             }
             else if (rows.Count == 0)
@@ -4218,6 +4773,21 @@ namespace Stilla
                         rCr += rows[i].CacheRead;
                     }
                     DrawMoreRow(g, "▾ 其他 " + (rowN - rowShown) + " 个", Numbers(rIn, rOut, rCw, rCr), pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
+                    if (colWidth[3] >= 1f)
+                    {
+                        double rest5 = 0, restW = 0;
+                        for (int i = rowShown; i < rowN; i++)
+                        {
+                            SpeedInfo rsi;
+                            if (speedBy != null && speedBy.TryGetValue(rows[i].Session, out rsi) && rsi.Known)
+                            {
+                                rest5 += rsi.P5;
+                                restW += rsi.Pw;
+                            }
+                        }
+                        DrawTextFit(g, rest5 > 0 || restW > 0 ? OccText(rest5, restW) : "", fSmall, TextDim,
+                            new RectangleF(pad + nameW + cacheW + colWidth[2], y + drawn * rowH, colWidth[3], rowH), StringAlignment.Far);
+                    }
                     drawn++;
                 }
                 else if (rowCollapse)
@@ -4229,31 +4799,816 @@ namespace Stilla
 
             // 合计行：这个时间段的合计（和表头对应）
             float yTotal = y + drawn * rowH + 3f * s;
+            tipYTotal = yTotal;
             using (Pen p = new Pen(Track))
             {
                 g.DrawLine(p, pad, yTotal - 2f * s, w - pad, yTotal - 2f * s);
+            }
+            DrawRowGrip(g, pad, inner, s, yTotal - 2f * s, drawn, false);
+            if (usageMode != 0)
+            {
+                ExtendDividers(g, h, yTotal + rowH * 2f + 2f * s);       // 行高拉大后表格可能比原来的面板高：竖分隔线跟着延长
             }
             DrawTextRect(g, "合计", fSmall, TextMain, new RectangleF(pad, yTotal, nameW, rowH), StringAlignment.Near);
             if (usageMode >= 1 && quota != null && quota.CalibErr >= 0)
             {
                 // 额度换算的自我检验：每一块数据都先用它之前的数据拟合、再去预测它，这是最近这些块的平均相对误差
-                DrawTextRect(g, "估算误差≈" + (quota.CalibErr * 100).ToString("0", CultureInfo.InvariantCulture) + "%", fSmall, TextDim,
+                DrawTextFit(g, "估算误差≈" + (quota.CalibErr * 100).ToString("0", CultureInfo.InvariantCulture) + "%", fSmall, TextDim,
                     new RectangleF(pad + 34f * s, yTotal, nameW - 34f * s, rowH), StringAlignment.Near);
             }
-            string[] totalNums = usageMode == 0 ? Numbers(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead)
-                : usageMode == 1 ? new string[] { UsageTracker.FormatTokens(cur.Total), TotalEstimateText(cur, false), TotalEstimateText(cur, true), UsageTracker.FormatTokens(cur.CacheRead) }
-                : usageMode == 3 ? TierTotalNums(cur)
-                : new string[] { UsageTracker.FormatTokens(cur.Total), cur.Total > 0 ? "100%" : "", TotalEstimateText(cur, false), "" };
-            DrawRowNumbers(g, pad, inner, colW, yTotal, rowH, totalNums, TextMain);
+            if (usageMode == 2)
+            {
+                long tOut = 0, tThink = 0;
+                foreach (UsageTracker.TierTotal tt in cur.TierRows)
+                {
+                    tOut += tt.Out;
+                    tThink += tt.Think;
+                }
+                DrawRowNumbers5(g, pad, inner, colW, yTotal, rowH, new string[]
+                {
+                    UsageTracker.FormatTokens(cur.Total), UsageTracker.FormatTokens(tOut), UsageTracker.FormatTokens(tThink), TotalEstimateText(cur, false), ""
+                }, TextMain);
+            }
+            else
+            {
+                string[] totalNums = usageMode == 0 ? Numbers(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead)
+                    : new string[] { UsageTracker.FormatTokens(cur.Total), TotalEstimateText(cur, false), TotalEstimateText(cur, true), UsageTracker.FormatTokens(cur.CacheRead) };
+                DrawRowNumbers(g, pad, inner, colW, yTotal, rowH, totalNums, TextMain);
+                if (usageMode == 0 && colWidth[3] >= 1f)
+                {
+                    // 占用列的合计：所有会话（含不在列表里的）近 N 分钟一共占用的额度
+                    DrawTextFit(g, speedKnown ? OccText(occ5, occW) : "—", fSmall, TextMain,
+                        new RectangleF(pad + nameW + cacheW + colWidth[2], yTotal, colWidth[3], rowH), StringAlignment.Far);
+                }
+            }
+            if (usageMode == 0 && Has(Feat.Health) && Show(Feat.HealthBadge))
+            {
+                // 合计行名字栏里的估算自检小提示（点它看详情）
+                HealthInfo hb = GetHealth();
+                if (hb.Short.Length > 0)
+                {
+                    RectangleF hr = new RectangleF(pad + 34f * s, yTotal, Math.Max(10f * s, nameW - 34f * s), rowH);
+                    DrawTextFit(g, hb.Short, fSmall, HealthColor(hb), hr, StringAlignment.Near);
+                    healthRect = hr;
+                }
+            }
+            float yNext = yTotal + rowH + 1f * s;
+            if (usageMode == 0)
+            {
+                // 合计行的「速度」格：所有会话加起来的消耗速度；下一行：按这个速度还能跑多久会触顶
+                if (extraW >= 1f)
+                {
+                    DrawTextFit(g, SpeedText(speedKnown, tot5, totW), fSmall, TextMain, new RectangleF(pad + nameW + cacheW, yTotal, extraW, rowH), StringAlignment.Far);
+                }
+                if (Show(Feat.Forecast))
+                {
+                    bool risk;
+                    string forecast = SpeedForecast(tot5, totW, speedKnown, out risk);
+                    DrawTextFit(g, forecast, fSmall, risk ? StateColor(CacheState.Urgent) : TextDim, new RectangleF(pad, yNext, inner, rowH), StringAlignment.Near);
+                    tipForecast = new RectangleF(pad, yNext, inner, rowH);
+                    yNext += rowH;
+                }
+            }
 
-            // 最后一行：按 DeepSeek 闲时价估算的费用（「如果这些 token 用 DeepSeek 要花多少」，默认不显示，右键菜单里可以打开）
-            if (showDeepSeek)
+            // 最后一行：估算自检发现偏差大时，换成警告；否则是按 DeepSeek 闲时价估算的费用（可以在设置里关掉）
+            HealthInfo hw = (Has(Feat.Health) && Show(Feat.HealthBadge)) ? GetHealth() : null;
+            if (hw != null && hw.Level >= 2)
+            {
+                RectangleF wr = new RectangleF(pad, yNext, inner, rowH);
+                DrawTextFit(g, hw.Line, fSmall, HealthColor(hw), wr, StringAlignment.Near);
+                healthRect = wr;
+            }
+            else if (Show(Feat.DsLine))
             {
                 double cost = EstimateCostCny(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead);
-                float yCost = yTotal + rowH + 1f * s;
-                DrawTextRect(g, "DeepSeek 闲时价估算（Flash）", fSmall, TextDim, new RectangleF(pad, yCost, inner * 0.7f, rowH), StringAlignment.Near);
-                DrawTextRect(g, "¥" + cost.ToString("0.00", CultureInfo.InvariantCulture), fLabel, TextMain, new RectangleF(pad + inner * 0.6f, yCost - 2f * s, inner * 0.4f, rowH + 4f * s), StringAlignment.Far);
+                tipDs = new RectangleF(pad, yNext, inner, rowH);
+                DrawTextRect(g, "DeepSeek 闲时价估算（Flash）", fSmall, TextDim, new RectangleF(pad, yNext, inner * 0.7f, rowH), StringAlignment.Near);
+                DrawTextRect(g, "¥" + cost.ToString("0.00", CultureInfo.InvariantCulture), fLabel, TextMain, new RectangleF(pad + inner * 0.6f, yNext - 2f * s, inner * 0.4f, rowH + 4f * s), StringAlignment.Far);
             }
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr min, IntPtr max);
+
+        private DateTime trimUtc = DateTime.MinValue;
+
+        // 后台读日志、解析大文件会留下一大堆垃圾，工作集能涨到两百多 MB。超过 120MB 就每 2 分钟在后台回收一次（只在超过时才做）
+        private void TrimMemoryIfBig()
+        {
+            if (!Has(Feat.Trim) || DateTime.UtcNow - trimUtc < TimeSpan.FromMinutes(2) || Environment.WorkingSet < 120L * 1024 * 1024)
+            {
+                return;
+            }
+            trimUtc = DateTime.UtcNow;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, (IntPtr)(-1), (IntPtr)(-1));
+                }
+                catch (Exception)
+                {
+                }
+            });
+        }
+
+        // 第一条要画 / 可以拖的分隔线：会话视图从名字 | 缓存剩余 开始；对比视图名字栏占前两列；其他视图名字栏占前三列
+        private int FirstEdge()
+        {
+            return usageMode == 0 ? 0 : usageMode == 2 ? 1 : 2;
+        }
+
+        // ---------------------------------------------------------------- 表头、排序、速度
+        private string HeadText(int mode, int col)
+        {
+            switch (mode)
+            {
+                case 0:
+                    return col == 1 ? "缓存剩余" : col == 2 ? "速度·" + SpeedLabel(speedMin) : col == 3 ? "占用·" + SpeedLabel(speedMin) : col == 4 ? "输入" : col == 5 ? "输出" : col == 6 ? "缓存写" : "缓存读";
+                case 1:
+                    return col == 3 ? "token" : col == 4 ? "5h估算" : col == 5 ? "周估算" : "缓存读";
+                case 2:
+                    return col == 2 ? "token" : col == 3 ? "输出" : col == 4 ? "思考" : col == 5 ? "5h估算" : "倍数";
+                case 3:
+                    return col == 3 ? "本期用量" : col == 4 ? "月费" : col == 5 ? "回本" : "续费";
+                default:
+                    return col == 3 ? "条数" : col == 4 ? "输入" : col == 5 ? "输出" : "估算费用";
+            }
+        }
+
+        private void DrawColumnHeaders(Graphics g, float pad, float headY, float s)
+        {
+            float hh = 14f * s;
+            string nameHead = usageMode == 0 ? "会话" : usageMode == 1 ? "模型" : usageMode == 2 ? "模型 · 档位" : usageMode == 3 ? "账号" : "API 模型";
+            int nameSpan = usageMode == 0 ? 1 : usageMode == 2 ? 2 : 3;
+            float nameWidth = 0;
+            for (int i = 0; i < nameSpan; i++)
+            {
+                nameWidth += colWidth[i];
+            }
+            bool sortable = usageMode <= 2;
+            DrawHeaderCell(g, nameHead, 0, pad, nameWidth, headY, hh, StringAlignment.Near, sortable, s);
+            if (usageMode == 0)
+            {
+                DrawMailButton(g, pad + 34f * s, headY, hh, s);       // 会话列最上方的「@」：邮件提醒设置
+            }
+            float x = pad + nameWidth;
+            for (int c = nameSpan; c < 8; c++)
+            {
+                if (colWidth[c] < 1f)
+                {
+                    continue;       // 隐藏的列
+                }
+                DrawHeaderCell(g, HeadText(usageMode, c), c, x, colWidth[c], headY, hh, StringAlignment.Far, sortable, s);
+                x += colWidth[c];
+            }
+        }
+
+        // 一个表头格：文字 + 右侧的排序小按钮（▲▼）。排序中的列文字用正常色，小按钮高亮；整格可以点
+        private void DrawHeaderCell(Graphics g, string text, int col, float x, float w, float y, float h, StringAlignment align, bool sortable, float s)
+        {
+            float gw = sortable ? 14f * s : 0f;
+            bool active = sortable && sortCol[usageMode] == col;
+            DrawTextFit(g, text, fSmall, active ? TextMain : TextDim, new RectangleF(x, y, Math.Max(10f * s, w - gw - 1f * s), h), align);
+            if (!sortable)
+            {
+                return;
+            }
+            DrawSortGlyph(g, new RectangleF(x + w - gw, y, gw, h), active ? (sortDesc[usageMode] ? 2 : 1) : 0, s);
+            headHits.Add(new KeyValuePair<RectangleF, int>(new RectangleF(x, y - 2f * s, w, h + 4f * s), col));
+            if (usageMode == 0 && col == 2)
+            {
+                speedHeadRect = new RectangleF(x, y - 2f * s, Math.Max(10f * s, w - gw), h + 4f * s);
+            }
+            if (usageMode == 0 && col == 3)
+            {
+                occHeadRect = new RectangleF(x, y - 2f * s, Math.Max(10f * s, w - gw), h + 4f * s);
+            }
+        }
+
+        // state：0 = 没排序（两个淡色小三角）、1 = 升序（▲亮）、2 = 降序（▼亮）
+        private void DrawSortGlyph(Graphics g, RectangleF r, int state, float s)
+        {
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            float a = 3.2f * s;
+            Color dim = SkinDraw.Mix(Bg, TextDim, 0.45f);
+            using (SolidBrush up = new SolidBrush(state == 1 ? TextMain : dim))
+            using (SolidBrush dn = new SolidBrush(state == 2 ? TextMain : dim))
+            {
+                g.FillPolygon(up, new PointF[] { new PointF(cx - a, cy - 1.2f * s), new PointF(cx + a, cy - 1.2f * s), new PointF(cx, cy - 1.2f * s - a * 1.3f) });
+                g.FillPolygon(dn, new PointF[] { new PointF(cx - a, cy + 1.2f * s), new PointF(cx + a, cy + 1.2f * s), new PointF(cx, cy + 1.2f * s + a * 1.3f) });
+            }
+        }
+
+        private UsageTracker.SessionTotal JumpAt(Point p)
+        {
+            if (!showUsage || usageMode != 0)
+            {
+                return null;
+            }
+            foreach (KeyValuePair<RectangleF, UsageTracker.SessionTotal> h in jumpHits)
+            {
+                if (h.Key.Contains(p))
+                {
+                    return h.Value;
+                }
+            }
+            return null;
+        }
+
+        // 跳到这个会话所在的窗口（VS Code 里开的：先切到标题里带这个会话文件夹名的 VS Code 窗口，再让扩展打开 / 回到这个会话；
+        // 终端里开的：切到它的终端窗口）。在后台线程里做；没找到窗口之类的情况用托盘通知告诉你
+        private void JumpToSession(UsageTracker.SessionTotal t)
+        {
+            string id = t.Session, name = t.Name;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg;
+                try
+                {
+                    msg = SessionJump.Go(id, name);
+                }
+                catch (Exception ex)
+                {
+                    msg = "跳转失败：" + ex.Message;
+                }
+                if (msg != null)
+                {
+                    try
+                    {
+                        BeginInvoke(new MethodInvoker(delegate { Balloon("跳转会话", msg); }));
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            });
+        }
+
+        // 鼠标在哪个表头格上（只有 会话 / 模型 / 对比 视图有排序），没有就是 -1
+        private int HeadAt(Point p)
+        {
+            if (!showUsage || usageMode > 2)
+            {
+                return -1;
+            }
+            foreach (KeyValuePair<RectangleF, int> hh in headHits)
+            {
+                if (hh.Key.Contains(p))
+                {
+                    return hh.Value;
+                }
+            }
+            return -1;
+        }
+
+        // 点表头：第一次 降序（时间 = 最新在前，用量 = 大的在前；对比视图的名字栏是 A→Z），再点一次反过来，第三次恢复默认顺序
+        private void ToggleSort(int col)
+        {
+            int m = usageMode;
+            if (m > 2)
+            {
+                return;
+            }
+            bool firstDesc = !(m == 2 && col == 0);
+            if (sortCol[m] != col)
+            {
+                sortCol[m] = col;
+                sortDesc[m] = firstDesc;
+            }
+            else if (sortDesc[m] == firstDesc)
+            {
+                sortDesc[m] = !firstDesc;
+            }
+            else
+            {
+                sortCol[m] = -1;
+                sortDesc[m] = true;
+            }
+            CollapseRows();
+            Redraw();
+            SaveSettings();
+        }
+
+        // 稳定排序：没有值的行永远排在最后；值相同的保持原来的顺序
+        private static void SortStable<T>(List<T> list, Func<T, double?> key, bool desc)
+        {
+            List<KeyValuePair<double?, int>> ks = new List<KeyValuePair<double?, int>>(list.Count);
+            for (int i = 0; i < list.Count; i++)
+            {
+                ks.Add(new KeyValuePair<double?, int>(key(list[i]), i));
+            }
+            ks.Sort(delegate(KeyValuePair<double?, int> a, KeyValuePair<double?, int> b)
+            {
+                if (!a.Key.HasValue || !b.Key.HasValue)
+                {
+                    if (a.Key.HasValue != b.Key.HasValue)
+                    {
+                        return a.Key.HasValue ? -1 : 1;
+                    }
+                    return a.Value.CompareTo(b.Value);
+                }
+                int c = a.Key.Value.CompareTo(b.Key.Value);
+                if (desc)
+                {
+                    c = -c;
+                }
+                return c != 0 ? c : a.Value.CompareTo(b.Value);
+            });
+            List<T> copy = new List<T>(list);
+            for (int i = 0; i < ks.Count; i++)
+            {
+                list[i] = copy[ks[i].Value];
+            }
+        }
+
+        private double? SessionSortKey(UsageTracker.SessionTotal t, int col, DateTime now)
+        {
+            UsageTracker.LiveInfo li;
+            usageSnap.Live.TryGetValue(t.Session, out li);
+            switch (col)
+            {
+                case 0:
+                    return (double)Math.Max(t.LastUtc.Ticks, li != null ? li.LastUtc.Ticks : 0);     // 最近活动的时间
+                case 1:
+                    {
+                        double rem;
+                        CacheState st = StateOf(li, t.Active, t.CacheExpiryUtc, now, out rem);
+                        if (st == CacheState.Running)
+                        {
+                            return 1000000;                 // 运行中：缓存一直在续期
+                        }
+                        return st == CacheState.None ? (double?)null : rem;     // 已过期 / 没缓存：永远在最后
+                    }
+                case 2:
+                    {
+                        SpeedInfo si = SpeedFor(t.Session);
+                        if (si != null && si.Known && (si.R5 > 0 || si.Rw > 0))
+                        {
+                            return 1e12 + si.R5 * 1000 + si.Rw;      // 当前窗口里有消耗的排在前面（先比 5 小时额度的速度，再比每周的）
+                        }
+                        return si != null && si.HasGray ? si.G5 * 1000 + si.Gw : (double?)null;     // 然后是灰色的历史平均速度；没有的永远在最后
+                    }
+                case 3:
+                    {
+                        SpeedInfo oi = SpeedFor(t.Session);
+                        if (oi != null && oi.Known && (oi.P5 > 0 || oi.Pw > 0))
+                        {
+                            return 1e12 + oi.P5 * 1000 + oi.Pw;      // 窗口里有占用的在前面（先比 5 小时额度，再比每周的），然后是灰色的
+                        }
+                        return oi != null && oi.HasGray ? oi.GP5 * 1000 + oi.GPw : (double?)null;
+                    }
+                case 4: return t.Input;
+                case 5: return t.Output;
+                case 6: return t.CacheWrite;
+                case 7: return t.CacheRead;
+            }
+            return null;
+        }
+
+        private void ApplySessionSort(List<UsageTracker.SessionTotal> rows)
+        {
+            int col = sortCol[0];
+            DateTime now = DateTime.UtcNow;
+            SortStable<UsageTracker.SessionTotal>(rows, delegate(UsageTracker.SessionTotal t) { return SessionSortKey(t, col, now); }, sortDesc[0]);
+        }
+
+        private double GroupPct(ModelGroup grp, bool week, out bool any)
+        {
+            double sum = 0;
+            any = false;
+            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+            {
+                double pct;
+                bool ap;
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, week, out pct, out ap))
+                {
+                    sum += pct;
+                    any = true;
+                }
+            }
+            return sum;
+        }
+
+        private void ApplyGroupSort(List<ModelGroup> groups)
+        {
+            int col = sortCol[1];
+            SortStable<ModelGroup>(groups, delegate(ModelGroup grp)
+            {
+                bool any;
+                switch (col)
+                {
+                    case 0:
+                        {
+                            long last = 0;
+                            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+                            {
+                                last = Math.Max(last, mt.LastUtc.Ticks);
+                            }
+                            return (double)last;
+                        }
+                    case 3: return grp.Total;
+                    case 4:
+                        {
+                            double v = GroupPct(grp, false, out any);
+                            return any ? v : (double?)null;
+                        }
+                    case 5:
+                        {
+                            double v = GroupPct(grp, true, out any);
+                            return any ? v : (double?)null;
+                        }
+                    case 6: return grp.CacheRead;
+                }
+                return null;
+            }, sortDesc[1]);
+        }
+
+        private void ApplyCompareSort(List<TierItem> items, Dictionary<TierItem, double> rate)
+        {
+            int col = sortCol[2];
+            List<string> names = new List<string>();
+            foreach (TierItem it in items)
+            {
+                string n = ShortModel(it.Model);
+                if (!names.Contains(n))
+                {
+                    names.Add(n);
+                }
+            }
+            names.Sort(StringComparer.Ordinal);
+            SortStable<TierItem>(items, delegate(TierItem it)
+            {
+                switch (col)
+                {
+                    case 0: return names.IndexOf(ShortModel(it.Model)) * 10 + TierRank(it.Tier);
+                    case 2: return it.Total;
+                    case 3: return it.Out;
+                    case 4: return it.Think;
+                    case 5: return it.HasPct ? it.Pct : (double?)null;
+                    case 6:
+                        {
+                            double r;
+                            return rate.TryGetValue(it, out r) ? r : (double?)null;
+                        }
+                }
+                return null;
+            }, sortDesc[2]);
+        }
+
+        private void DrawJumpIcon(Graphics g, RectangleF r, float s)
+        {
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f, a = 3.6f * s, h = 3.2f * s;
+            using (Pen p = new Pen(SkinDraw.Mix(Bg, TextDim, 0.9f), 1.3f * s))
+            {
+                g.DrawLine(p, cx - a, cy + a, cx + a, cy - a);
+                g.DrawLine(p, cx + a - h, cy - a, cx + a, cy - a);
+                g.DrawLine(p, cx + a, cy - a, cx + a, cy - a + h);
+            }
+        }
+
+        // 每个会话近 speedMin 分钟消耗的额度折成「%/小时」：这段时间里它每条消息按额度换算（含档位修正）加起来，除以窗口长度。
+        // 窗口按墙上时间算（不是只算它活动的那几分钟）：所以闲下来的会话速度会降下去，合计才能直接拿来估「照这个速度还能跑多久」。
+        // 近 3 小时的消息来自实时追踪，更早的来自从日志读的历史（speedHist）；两边按时间切开，不会重复算
+        private Dictionary<string, SpeedInfo> ComputeSpeeds(DateTime nowUtc, out double tot5, out double totW, out bool known)
+        {
+            Dictionary<string, SpeedInfo> d = new Dictionary<string, SpeedInfo>();
+            tot5 = 0;
+            totW = 0;
+            known = false;
+            occ5 = 0;
+            occW = 0;
+            speedApprox = false;
+            speedNowUtc = nowUtc;
+            DateTime from = nowUtc.AddMinutes(-speedMin);
+            double hours = speedMin / 60.0;
+            DateTime ks = KeyStart();
+            if (ks > from)
+            {
+                // 窗口比「换套餐到现在」还长：只算换了之后的，除以这段实际的时间（至少 5 分钟，免得刚换完速度被放大）
+                from = ks;
+                hours = Math.Max((nowUtc - from).TotalHours, Math.Min(speedMin / 60.0, 5.0 / 60.0));
+            }
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                SpeedInfo si = new SpeedInfo();
+                double p5, pw;
+                if (SumPct(kv.Key, kv.Value, from, nowUtc, out p5, out pw))
+                {
+                    si.Known = true;
+                    si.R5 = p5 / hours;
+                    si.Rw = pw / hours;
+                    si.P5 = p5;
+                    si.Pw = pw;
+                    occ5 += p5;
+                    occW += pw;
+                    tot5 += si.R5;
+                    totW += si.Rw;
+                    known = true;
+                }
+                d[kv.Key] = si;
+            }
+            // 窗口超过 3 小时时，合计还要加上「已经不在会话列表里」的会话（日志历史里有、实时追踪里没有）：合计是整个账号的消耗速度，不只是列表里这几行
+            if (speedMin > 180 && speedHist != null)
+            {
+                foreach (KeyValuePair<string, List<UsageTracker.RecentUse>> kv in speedHist)
+                {
+                    double p5, pw;
+                    if (!usageSnap.Live.ContainsKey(kv.Key) && SumPct(kv.Key, null, from, nowUtc, out p5, out pw))
+                    {
+                        tot5 += p5 / hours;
+                        totW += pw / hours;
+                        occ5 += p5;
+                        occW += pw;
+                        known = true;
+                    }
+                }
+            }
+            return d;
+        }
+
+        private bool AddUse(UsageTracker.RecentUse u, ref double p5, ref double pw)
+        {
+            if (u.Utc < KeyStart())
+            {
+                return false;       // 换账号 / 套餐之前的用量用的是别的额度，不算进当前口径的速度
+            }
+            double p;
+            bool ap;
+            bool ok = false;
+            if (TierPct(u.Model, u.Tier, u.Tok, false, out p, out ap))
+            {
+                p5 += p;
+                ok = true;
+                speedApprox = speedApprox || ap;
+            }
+            if (TierPct(u.Model, u.Tier, u.Tok, true, out p, out ap))
+            {
+                pw += p;
+            }
+            return ok;
+        }
+
+        // 这个会话在 [from, to]（UTC）里的消息折成额度百分点（5 小时 / 每周）。有额度换算系数才返回 true
+        private bool SumPct(string session, UsageTracker.LiveInfo li, DateTime from, DateTime to, out double p5, out double pw)
+        {
+            p5 = 0;
+            pw = 0;
+            bool known = false;
+            DateTime histCut = speedNowUtc.AddMinutes(-180);
+            if (li != null)
+            {
+                foreach (UsageTracker.RecentUse u in li.Recent)
+                {
+                    if (u.Utc >= from && u.Utc <= to)
+                    {
+                        known |= AddUse(u, ref p5, ref pw);
+                    }
+                }
+            }
+            List<UsageTracker.RecentUse> hl;
+            if (from < histCut && speedHist != null && speedHist.TryGetValue(session, out hl))
+            {
+                for (int i = hl.Count - 1; i >= 0; i--)
+                {
+                    UsageTracker.RecentUse u = hl[i];
+                    if (u.Utc >= histCut || u.Utc > to)
+                    {
+                        continue;
+                    }
+                    if (u.Utc < from)
+                    {
+                        break;
+                    }
+                    known |= AddUse(u, ref p5, ref pw);
+                }
+            }
+            return known;
+        }
+
+        // 这个会话最近一次活动的时间（UTC）：实时追踪里最新的一条，没有就取日志历史里最新的一条
+        private DateTime LastActivity(string session, UsageTracker.LiveInfo li)
+        {
+            DateTime last = DateTime.MinValue;
+            if (li != null)
+            {
+                foreach (UsageTracker.RecentUse u in li.Recent)
+                {
+                    if (u.Utc > last)
+                    {
+                        last = u.Utc;
+                    }
+                }
+            }
+            List<UsageTracker.RecentUse> hl;
+            if (last == DateTime.MinValue && speedHist != null && speedHist.TryGetValue(session, out hl) && hl.Count > 0)
+            {
+                last = hl[hl.Count - 1].Utc;
+            }
+            return last;
+        }
+
+        // 一个会话的速度：当前窗口里有用量就是当前速度；没有（闲下来了 / 缓存过期了）就再算一个灰色的「过去活动时的平均速度」：
+        // 窗口长度还是 speedMin，但取到它最后一次活动为止。只给会话视图里要画 / 要排序的行算，算过的存在 speedBy 里
+        private SpeedInfo SpeedFor(string session)
+        {
+            if (speedBy == null)
+            {
+                return null;
+            }
+            SpeedInfo si;
+            if (!speedBy.TryGetValue(session, out si))
+            {
+                si = new SpeedInfo();
+                speedBy[session] = si;
+            }
+            if (!si.GrayDone && !(si.Known && (si.R5 > 0 || si.Rw > 0)))
+            {
+                si.GrayDone = true;
+                UsageTracker.LiveInfo li;
+                usageSnap.Live.TryGetValue(session, out li);
+                DateTime last = LastActivity(session, li);
+                if (last > DateTime.MinValue)
+                {
+                    double p5, pw;
+                    if (SumPct(session, li, last.AddMinutes(-speedMin), last, out p5, out pw))
+                    {
+                        double hours = speedMin / 60.0;
+                        si.HasGray = true;
+                        si.G5 = p5 / hours;
+                        si.Gw = pw / hours;
+                        si.GP5 = p5;
+                        si.GPw = pw;
+                    }
+                }
+            }
+            return si;
+        }
+
+        // 从日志读最近 8 天的消息（后台、低优先级，最多 5 分钟一次，只在会话视图开着时读）
+        private void StartSpeedHistory()
+        {
+            if (!Has(Feat.History) || speedHistBusy || (speedHist != null && DateTime.UtcNow - speedHistUtc < TimeSpan.FromMinutes(Cad().HistMin)))
+            {
+                return;
+            }
+            speedHistBusy = true;
+            speedHistUtc = DateTime.UtcNow;
+            string detail = logger.DetailPath;
+            bool wantLife = false;          // 成本列已经换成「占用」，不再需要读每个会话的全部历史
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, List<UsageTracker.RecentUse>> res = null;
+                Dictionary<string, Dictionary<string, long[]>> life = null;
+                ThreadPriority old = Thread.CurrentThread.Priority;
+                try
+                {
+                    Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                    SpeedHistory.Result rr = SpeedHistory.ReadAll(detail, DateTime.Now.AddDays(-8), wantLife);
+                    res = rr.Recent;
+                    life = wantLife ? rr.Life : null;
+                }
+                catch (Exception)
+                {
+                }
+                finally
+                {
+                    try
+                    {
+                        Thread.CurrentThread.Priority = old;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (res != null)
+                        {
+                            speedHist = res;
+                        }
+                        if (life != null)
+                        {
+                            sessionLife = life;
+                        }
+                        speedHistBusy = false;
+                        Redraw();
+                    }));
+                }
+                catch (Exception)
+                {
+                    speedHistBusy = false;
+                }
+            });
+        }
+
+        private static string SpeedSpan(int mins)
+        {
+            return mins < 60 ? mins + " 分钟" : mins % 60 == 0 ? (mins / 60) + " 小时" : (mins / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " 小时";
+        }
+
+        private static string SpeedLabel(int mins)
+        {
+            return mins < 60 ? mins + "m" : mins % 60 == 0 ? (mins / 60) + "h" : (mins / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + "h";
+        }
+
+        private static bool Finite(double v)
+        {
+            return !double.IsNaN(v) && !double.IsInfinity(v);
+        }
+
+        private static string RateText(double v, bool week)
+        {
+            if (!Finite(v))
+            {
+                return "—";
+            }
+            return v >= 10 ? v.ToString("0", CultureInfo.InvariantCulture)
+                : v >= 1 || (week && v >= 0.1) ? v.ToString(week ? "0.00" : "0.0", CultureInfo.InvariantCulture) : v.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private string SpeedText(bool known, double r5, double rw)
+        {
+            return !known || (r5 <= 0 && rw <= 0) ? "—" : (quota != null && quota.PlanDerived ? "≈" : "") + RateText(r5, false) + " / " + RateText(rw, true);
+        }
+
+        // 按近 speedMin 分钟的速度，5 小时额度 / 每周额度还能撑多久、会不会在重置前触顶
+        private string SpeedForecast(double r5, double rw, bool known, out bool risk)
+        {
+            risk = false;
+            if (data == null)
+            {
+                return "";
+            }
+            if (!known)
+            {
+                return quota == null || quota.Stale ? "触顶预测：当前账号的额度换算系数还没算出来，暂时没法算速度（见「订阅」视图）"
+                    : "触顶预测：近 " + SpeedSpan(speedMin) + "没有消耗";
+            }
+            DateTime now = DateTime.Now;
+            return "按近 " + SpeedSpan(speedMin) + "速度" + (quota != null && quota.PlanDerived ? "（≈系数是按套餐倍率推算的，可能差好几倍）" : speedApprox ? "（≈估算）" : "") + " · " + LimitText("5h", data.FiveHour, r5, now, ref risk) + " · " + LimitText("周", data.SevenDay, rw, now, ref risk);
+        }
+
+        private static string LimitText(string name, Quota q, double ratePerHour, DateTime now, ref bool risk)
+        {
+            if (q == null)
+            {
+                return name + " —";
+            }
+            double left = 100 - q.Percent;
+            if (left <= 0)
+            {
+                risk = true;
+                return name + " 已满";
+            }
+            if (ratePerHour <= 0.001)
+            {
+                return name + " 没有消耗";
+            }
+            double hrs = left / ratePerHour;
+            string t = name + " 约 " + HoursText(hrs) + "后触顶";
+            if (q.ResetsAt.HasValue)
+            {
+                double toReset = (q.ResetsAt.Value - now).TotalHours;
+                if (toReset > 0)
+                {
+                    if (hrs < toReset)
+                    {
+                        risk = true;
+                        t += "（早于重置 " + HoursText(toReset - hrs) + "）";
+                    }
+                    else
+                    {
+                        t += "（重置前不会）";
+                    }
+                }
+            }
+            return t;
+        }
+
+        // 点「速度」表头：选统计窗口
+        private void ShowSpeedMenu(RectangleF at)
+        {
+            ContextMenuStrip m = new ContextMenuStrip();
+            FillSpeedItems(m.Items);
+            m.Closed += delegate { BeginInvoke(new MethodInvoker(delegate { m.Dispose(); })); };
+            m.Show(this, new Point((int)at.X, (int)at.Bottom + 2));
+        }
+
+        private void SetSpeedWindow(int mins)
+        {
+            speedMin = Math.Max(1, Math.Min(2880, mins));
+            foreach (SpeedInfo si in speedBy != null ? new List<SpeedInfo>(speedBy.Values) : new List<SpeedInfo>())
+            {
+                si.GrayDone = false;
+            }
+            Redraw();
+            SaveSettings();
         }
 
         // 一个会话的活跃程度：0 = 正在写入（最近 60 秒有动静），1 = 缓存还没过期，2 = 已过期或没有缓存。
@@ -4264,7 +5619,7 @@ namespace Stilla
             UsageTracker.LiveInfo li;
             if (usageSnap.Live.TryGetValue(session, out li))
             {
-                active = active || li.Active;
+                active = active || li.Active || li.Waiting;
                 if (!expiry.HasValue)
                 {
                     expiry = li.ExpiryUtc;
@@ -4339,15 +5694,8 @@ namespace Stilla
             public long Total, CacheRead;
         }
 
-        private sealed class ModelLine
-        {
-            public ModelGroup Group;
-            public UsageTracker.ModelTotal Part;     // null = 会话行（组行），否则是展开后的子行
-            public bool Expanded;
-        }
-
-        // 平铺成要显示的行：组行 + （展开了的）子行。会话的顺序和会话视图一样：正在用的在上面，缓存没过期的其次，过期的往下
-        private List<ModelLine> BuildModelLines(UsageTracker.PeriodSummary cur)
+        // 会话的顺序和会话视图一样：正在用的在最上面，缓存没过期的其次，过期的往下
+        private List<ModelGroup> BuildModelGroups(UsageTracker.PeriodSummary cur)
         {
             Dictionary<string, ModelGroup> map = new Dictionary<string, ModelGroup>();
             List<ModelGroup> groups = new List<ModelGroup>();
@@ -4382,25 +5730,16 @@ namespace Stilla
                 keys.Add(k);
             }
             keys.Sort(CompareKeys);
-            List<ModelLine> lines = new List<ModelLine>();
+            List<ModelGroup> sorted = new List<ModelGroup>(keys.Count);
             foreach (RowKey k in keys)
             {
-                ModelLine head = new ModelLine();
-                head.Group = k.Group;
-                head.Expanded = k.Group.Parts.Count > 1 && expandedGroups.Contains(k.Group.Session);
-                lines.Add(head);
-                if (head.Expanded)
-                {
-                    foreach (UsageTracker.ModelTotal p in k.Group.Parts)
-                    {
-                        ModelLine child = new ModelLine();
-                        child.Group = k.Group;
-                        child.Part = p;
-                        lines.Add(child);
-                    }
-                }
+                sorted.Add(k.Group);
             }
-            return lines;
+            if (sortCol[1] >= 0)
+            {
+                ApplyGroupSort(sorted);
+            }
+            return sorted;
         }
 
         // 行太多时怎么显示：没展开 → 前 cap-1 行 +「其他 k 个」；展开 → 能放下几行放几行（留一行给「收起」），多出来的用滚轮翻
@@ -4440,7 +5779,7 @@ namespace Stilla
         private void DrawMoreRow(Graphics g, string text, string[] nums, float pad, float inner, float s, float colW, float nameW, float y, float rowH)
         {
             moreRect = new RectangleF(pad, y, inner, rowH);
-            DrawTextRect(g, text, fSmall, Accent, new RectangleF(pad + 4f * s, y, nameW - 4f * s, rowH), StringAlignment.Near);
+            DrawTextFit(g, text, fSmall, Accent, new RectangleF(pad + 4f * s, y, nameW - 4f * s, rowH), StringAlignment.Near);
             if (nums != null)
             {
                 DrawRowNumbers(g, pad, inner, colW, y, rowH, nums, TextDim);
@@ -4451,7 +5790,8 @@ namespace Stilla
         private int RowCountNow()
         {
             UsageTracker.PeriodSummary cur = PeriodFor(usagePeriod);
-            return usageMode == 1 ? BuildModelLines(cur).Count : usageMode == 4 ? AccountStore.Accounts.Count : cur.Rows.Count;
+            return usageMode == 1 ? BuildModelGroups(cur).Count : usageMode == 2 ? BuildTierItems(cur).Count : usageMode == 3 ? AccountStore.Accounts.Count
+                : usageMode == 4 ? (apiRows == null ? 1 : apiRows.Count) : cur.Rows.Count;
         }
 
         // 展开：窗口长高到刚好放下全部行（最高到屏幕可用高度，放不下的用滚轮翻）；再点一次收起，窗口恢复原来的高度
@@ -4465,7 +5805,7 @@ namespace Stilla
             rowsExpanded = true;
             rowScroll = 0;
             savedWinHu = winHu;
-            int need = CompactH() + 146 + (RowCountNow() + 1) * 16 + 40;
+            int need = CompactH() + 154 + (RowCountNow() + 3) * rowHu;
             Rectangle wa = Screen.FromControl(this).WorkingArea;
             int target = Math.Min(need, (int)Math.Floor((wa.Height - 16) / scale));
             if (target > CurH())
@@ -4519,7 +5859,9 @@ namespace Stilla
         // 时间标签：交给当前风格去画；只画勾选显示的标签，平均分宽；标签太多放不下时字号自动缩小
         private void DrawTabStrip(Graphics g, List<int> shown, float pad, float y0, float inner, float s)
         {
-            float cell = inner / shown.Count;
+            float moreW = 22f * s;                  // 标签条最右边留给「⋯」扩展按钮
+            tabMoreRect = RectangleF.Empty;
+            float cell = (inner - moreW) / shown.Count;
             float widest = 0;
             foreach (int i in shown)
             {
@@ -4550,30 +5892,51 @@ namespace Stilla
                 };
                 skin.DrawTab(g, rect, t, f, curPal, s);
             }
+            DrawTabMore(g, pad + inner - moreW, y0, moreW, s);
         }
+
+        private float modeSwitchX;      // left edge of the view buttons in the last frame (the pause note sits to the left of it)
 
         // 表头右边的四个视图按钮：会话 / 模型 / 对比 / 档位（点按钮直接切换）
         private void DrawModeSwitch(Graphics g, int w, float pad, float y, float s)
         {
-            string[] names = { "会话", "模型", "对比", "档位", "订阅" };
-            float segW = 34f * s, segH = 18f * s;
-            float x0 = w - pad - segW * names.Length;
-            for (int i = 0; i < names.Length; i++)
+            string[] all = Feat.VNames;
+            List<string> names = new List<string>();
+            List<int> ids = new List<int>();
+            for (int i = 0; i < all.Length; i++)
             {
-                segRects[i] = new RectangleF(x0 + segW * i, y, segW, segH);
+                segRects[i] = RectangleF.Empty;
+                if ((vmask & (1 << i)) != 0)
+                {
+                    names.Add(all[i]);
+                    ids.Add(i);
+                }
             }
-            skin.DrawModes(g, segRects, names, usageMode, FontsNow(), curPal, s);
+            float segW = 34f * s, segH = 18f * s;
+            float x0 = w - pad - segW * names.Count;
+            modeSwitchX = x0;
+            RectangleF[] vis = new RectangleF[names.Count];
+            for (int k = 0; k < names.Count; k++)
+            {
+                vis[k] = new RectangleF(x0 + segW * k, y, segW, segH);
+                segRects[ids[k]] = vis[k];
+            }
+            skin.DrawModes(g, vis, names.ToArray(), ids.IndexOf(usageMode), FontsNow(), curPal, s);
         }
 
-        // 一个会话一行：有活跃标记的画绿点；名字；缓存剩余时间；四项用量
+        // 一个会话一行：状态点（颜色见下）；名字；缓存剩余 / 状态；四项用量
         private void DrawSessionRow(Graphics g, UsageTracker.SessionTotal t, float pad, float inner, float s, float colW, float cacheW, float nameW, float y, float rowH)
         {
+            UsageTracker.LiveInfo li;
+            usageSnap.Live.TryGetValue(t.Session, out li);
+            double remMin;
+            CacheState st = StateOf(li, t.Active, t.CacheExpiryUtc, DateTime.UtcNow, out remMin);
             Color c = t.Active ? TextMain : TextDim;
-            if (t.Active)
+            if (st != CacheState.None)
             {
-                using (SolidBrush gb = new SolidBrush(Green))
+                using (SolidBrush gb = new SolidBrush(StateColor(st)))
                 {
-                    g.FillEllipse(gb, pad, y + 5f * s, 6f * s, 6f * s);
+                    g.FillEllipse(gb, pad, y + (rowH - 6f * s) / 2f, 6f * s, 6f * s);
                 }
             }
 
@@ -4583,33 +5946,312 @@ namespace Stilla
             {
                 name += " +" + t.SubCount + "子";
             }
-            DrawTextRect(g, name, fSmall, c, new RectangleF(pad + 12f * s, y, nameW - 12f * s, rowH), StringAlignment.Near);
-
-            // 缓存剩余：主会话最近一次读写缓存的时间 + 有效期，还没到期就显示倒计时
-            string cacheText;
-            Color cacheColor;
-            if (t.CacheExpiryUtc.HasValue)
+            bool jumpOn = Show(Feat.Jump);
+            bool watched = MailStore.Enabled && MailStore.Find(t.Session) != null;      // 勾选了邮件提醒的会话：名字后面标一个 @
+            float rightPad = (jumpOn ? 16f * s : 0f) + (watched ? 11f * s : 0f);
+            DrawTextRect(g, name, fSmall, c, new RectangleF(pad + 12f * s, y, Math.Max(10f * s, nameW - 12f * s - rightPad), rowH), StringAlignment.Near);
+            if (watched)
             {
-                TimeSpan rem = t.CacheExpiryUtc.Value - DateTime.UtcNow;
-                if (rem > TimeSpan.Zero)
-                {
-                    cacheText = FormatRemain(rem);
-                    cacheColor = Green;
-                }
-                else
-                {
-                    cacheText = "已过期";
-                    cacheColor = TextDim;
-                }
+                DrawTextRect(g, "@", fSmall, Accent, new RectangleF(pad + nameW - rightPad - 4f * s, y, 19f * s, rowH), StringAlignment.Center);
+            }
+            if (jumpOn)
+            {
+                // 名字右边的 ↗：点它跳转到这个会话所在的窗口
+                RectangleF jr = new RectangleF(pad + nameW - 16f * s, y, 16f * s, rowH);
+                DrawJumpIcon(g, jr, s);
+                jumpHits.Add(new KeyValuePair<RectangleF, UsageTracker.SessionTotal>(jr, t));
+            }
+
+            // 缓存剩余：运行中（绿）/ 等你处理（蓝，后面跟缓存倒计时）/ 倒计时：30~60 分钟白、10~30 黄、0~10 红；到期了是「已过期」
+            string cacheText;
+            Color cacheColor = StateColor(st);
+            if (st == CacheState.Running)
+            {
+                cacheText = "运行中";
+            }
+            else if (st == CacheState.Waiting)
+            {
+                cacheText = remMin > 0 ? "等你 " + FormatRemain(TimeSpan.FromMinutes(remMin)) : "等你处理";
+            }
+            else if (st != CacheState.None)
+            {
+                cacheText = FormatRemain(TimeSpan.FromMinutes(remMin));
+            }
+            else if (t.CacheExpiryUtc.HasValue || (li != null && li.ExpiryUtc.HasValue))
+            {
+                cacheText = "已过期";
             }
             else
             {
                 cacheText = "无缓存";
-                cacheColor = TextDim;
             }
-            DrawTextRect(g, cacheText, fSmall, cacheColor, new RectangleF(pad + nameW, y, cacheW, rowH), StringAlignment.Far);
+            if (cacheW >= 1f)
+            {
+                DrawTextFit(g, cacheText, fSmall, cacheColor, new RectangleF(pad + nameW, y, cacheW, rowH), StringAlignment.Far);
+            }
 
+            // 速度：当前窗口里有消耗 = 正常色；没有（闲下来 / 缓存过期了）= 灰色的「过去活动时的平均速度」；都没有 = —
+            if (colWidth[2] >= 1f)
+            {
+                SpeedInfo si = SpeedFor(t.Session);
+                bool curSpeed = si != null && si.Known && (si.R5 > 0 || si.Rw > 0);
+                bool graySpeed = !curSpeed && si != null && si.HasGray && (si.G5 > 0 || si.Gw > 0);
+                DrawTextFit(g, curSpeed ? SpeedText(true, si.R5, si.Rw) : graySpeed ? SpeedText(true, si.G5, si.Gw) : "—", fSmall, curSpeed ? TextMain : TextDim,
+                    new RectangleF(pad + nameW + cacheW, y, colWidth[2], rowH), StringAlignment.Far);
+            }
+
+            if (colWidth[3] >= 1f)
+            {
+                DrawOccCell(g, t, pad + nameW + cacheW + colWidth[2], y, colWidth[3], rowH, c);       // 占用：同一个统计窗口里占用的 5h / 周额度
+            }
             DrawRowNumbers(g, pad, inner, colW, y, rowH, Numbers(t.Input, t.Output, t.CacheWrite, t.CacheRead), c);
+        }
+
+        // ---------------------------------------------------------------- 缓存提醒
+        // Claude 的提示缓存过期后（有效期 5 分钟或 1 小时，看这个会话最近一次写缓存用的是哪种），下一条消息要把整个上下文重新写一遍缓存，
+        // 比续上（读缓存）贵几十倍。所以给每个会话一个状态颜色，快过期时弹系统通知，趁还来得及发一条消息把缓存续上。
+        //   绿 = 运行中（Claude Code 报告 busy，或最近 60 秒有新记录；缓存随请求自动续期）
+        //   蓝 = 在等你处理（Claude Code 报告 waiting：权限确认 / 提问 / 计划审批等弹窗）。不是做完了，也不是在跑；它卡着，缓存还在倒数
+        //   红 = 剩 0~10 分钟（会弹系统通知）  黄 = 10~30  白 = 30~60（常规色）  灰 = 已过期 / 没有缓存
+        private enum CacheState { None = 0, Fresh = 1, Running = 2, Soon = 3, Waiting = 4, Urgent = 5 }   // 数字越大越要紧（总览取最大的）
+
+        private const long AlertMinCtx = 50000;     // 上下文小于这个数的会话，缓存过期了也不心疼，不弹通知
+
+        private CacheState StateOf(UsageTracker.LiveInfo li, bool activeHint, DateTime? expiryHint, DateTime nowUtc, out double remMin)
+        {
+            remMin = 0;
+            DateTime? exp = expiryHint.HasValue ? expiryHint : (li != null ? li.ExpiryUtc : null);
+            double rem = exp.HasValue ? (exp.Value - nowUtc).TotalMinutes : 0;
+            if (li != null && li.Waiting)
+            {
+                remMin = Math.Max(0, rem);      // 在等你的时候缓存照样在倒数：蓝色，但剩余时间还要给出来
+                return CacheState.Waiting;
+            }
+            if (activeHint || (li != null && li.Active))
+            {
+                return CacheState.Running;
+            }
+            if (!exp.HasValue || rem <= 0)
+            {
+                return CacheState.None;
+            }
+            remMin = rem;
+            return rem <= 10 ? CacheState.Urgent : rem <= 30 ? CacheState.Soon : CacheState.Fresh;
+        }
+
+        private CacheState StateOf(UsageTracker.LiveInfo li, DateTime nowUtc, out double remMin)
+        {
+            return StateOf(li, false, null, nowUtc, out remMin);
+        }
+
+        // 状态颜色固定成红黄绿蓝（不跟皮肤走：皮肤里的绿 / 黄 / 红被调成了黑白橙），只按亮 / 暗主题调深浅；白 = 常规字色
+        private Color StateColor(CacheState st)
+        {
+            switch (st)
+            {
+                case CacheState.Urgent: return inverted ? Color.FromArgb(248, 113, 113) : Color.FromArgb(220, 38, 38);
+                case CacheState.Soon: return inverted ? Color.FromArgb(250, 204, 21) : Color.FromArgb(202, 138, 4);
+                case CacheState.Running: return inverted ? Color.FromArgb(74, 222, 128) : Color.FromArgb(22, 163, 74);
+                case CacheState.Waiting: return inverted ? Color.FromArgb(96, 165, 250) : Color.FromArgb(37, 99, 235);
+                case CacheState.Fresh: return TextMain;
+                default: return TextDim;
+            }
+        }
+
+        // 所有还有缓存 / 在跑的会话里最要紧的状态，以及红、黄、绿、蓝各几个
+        private CacheState OverallState(out int urgent, out int soon, out int running, out int waiting)
+        {
+            urgent = soon = running = waiting = 0;
+            CacheState best = CacheState.None;
+            DateTime now = DateTime.UtcNow;
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                double rem;
+                CacheState st = StateOf(kv.Value, now, out rem);
+                if (st == CacheState.Urgent) urgent++;
+                else if (st == CacheState.Soon) soon++;
+                else if (st == CacheState.Running) running++;
+                else if (st == CacheState.Waiting) waiting++;
+                if (st > best)
+                {
+                    best = st;
+                }
+            }
+            return best;
+        }
+
+        private string LiveTitle(string session)
+        {
+            foreach (UsageTracker.PeriodSummary p in usageSnap.Periods)
+            {
+                foreach (UsageTracker.SessionTotal t in p.Rows)
+                {
+                    if (t.Session == session)
+                    {
+                        return t.Title ?? (t.Name + " · " + t.ShortId);
+                    }
+                }
+            }
+            return SessionNames.Get(session) ?? session.Substring(0, Math.Min(6, session.Length));
+        }
+
+        // 过期后重新载入要多花多少：上下文 × 缓存写入价；续上只要读缓存价。有模型价格表才算
+        private string ReloadCostText(UsageTracker.LiveInfo li)
+        {
+            QuotaTable.Entry e;
+            if (quota == null || string.IsNullOrEmpty(li.Model) || li.Ctx <= 0 || !quota.Models.TryGetValue(BaseModel(li.Model), out e))
+            {
+                return "";
+            }
+            double write = (li.TtlMin >= 60 ? e.Price[3] : e.Price[2]) * li.Ctx / 1000000.0;
+            double read = e.Price[4] * li.Ctx / 1000000.0;
+            string text = "，过期后重新载入约 " + UsdText(write) + "（续上约 " + UsdText(read) + "）";
+            if (!quota.Stale && e.K5 > 0)
+            {
+                text += "≈" + (write * e.K5).ToString("0.0", CultureInfo.InvariantCulture) + "% 的 5 小时额度";
+            }
+            return text;
+        }
+
+        // 哪些会话该提醒：缓存剩余刚从 10 分钟以上掉到 10 分钟以内（要刚好看到「掉下去」这一下，所以刚启动时已经在红色的不提醒），
+        // 有效期 ≥ 30 分钟（5 分钟有效期的会话每回复一次就是红的，会天天响）、上下文够大、没在跑。同时更新每个会话上一次的剩余时间
+        private List<string> CollectCacheAlerts(DateTime now)
+        {
+            List<string> hit = new List<string>();
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                double rem;
+                CacheState st = StateOf(kv.Value, now, out rem);
+                double prev;
+                bool had = cacheRem.TryGetValue(kv.Key, out prev);
+                bool counting = st == CacheState.Urgent || st == CacheState.Soon || st == CacheState.Fresh || (st == CacheState.Waiting && rem > 0);
+                cacheRem[kv.Key] = counting ? rem : 99;
+                if (alertsOn && !paused && had && prev > alertMin && counting && rem <= alertMin && kv.Value.TtlMin >= 30 && kv.Value.Ctx >= AlertMinCtx)
+                {
+                    hit.Add(kv.Key);
+                }
+            }
+            return hit;
+        }
+
+        // 通知文字：最多列 3 个会话（标题、剩几分钟、上下文大小、重新载入要多花多少），多的写「另外 N 个」
+        private string BuildAlertText(List<string> hit, DateTime now, out string title)
+        {
+            LoadQuota();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < hit.Count && i < 3; i++)
+            {
+                UsageTracker.LiveInfo li = usageSnap.Live[hit[i]];
+                double rem;
+                StateOf(li, now, out rem);
+                string name = LiveTitle(hit[i]);
+                if (name.Length > 16)
+                {
+                    name = name.Substring(0, 16) + "…";
+                }
+                sb.Append("「").Append(name).Append("」剩 ").Append(Math.Max(1, (int)Math.Round(rem))).Append(" 分钟 · 上下文 ")
+                    .Append(UsageTracker.FormatTokens(li.Ctx)).Append(ReloadCostText(li)).Append(li.Waiting ? "（它在等你处理）" : "").Append('\n');
+            }
+            if (hit.Count > 3)
+            {
+                sb.Append("…另外 ").Append(hit.Count - 3).Append(" 个会话");
+            }
+            title = "Claude 缓存 " + alertMin + " 分钟内过期" + (hit.Count > 1 ? "（" + hit.Count + " 个会话）" : "");
+            string text = sb.ToString().TrimEnd('\n');
+            return text.Length > 250 ? text.Substring(0, 250) : text;
+        }
+
+        // 每个 tick 看一遍：该提醒的弹系统通知；再更新托盘图标的状态点、托盘提示和卡片上的状态点
+        private void UpdateCacheIndicators()
+        {
+            DateTime now = DateTime.UtcNow;
+            List<string> hit = CollectCacheAlerts(now);
+            try
+            {
+                CheckMailAlerts(now);
+            }
+            catch (Exception)
+            {
+            }
+            if (hit.Count > 0)
+            {
+                string title;
+                string text = BuildAlertText(hit, now, out title);
+                Balloon(title, text);
+            }
+
+            int urgent, soon, running, waiting;
+            CacheState overall = OverallState(out urgent, out soon, out running, out waiting);
+            int key = ((((urgent * 100 + soon) * 100 + running) * 100 + waiting) * 10) + (int)overall;
+            if (key != indicatorKey)
+            {
+                indicatorKey = key;
+                indicatorState = overall;
+                cUrgent = urgent;
+                cSoon = soon;
+                cRunning = running;
+                cWaiting = waiting;
+                UpdateTrayDot(overall);
+                UpdateTrayText();
+                Redraw();
+            }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr handle);
+
+        // 托盘图标右下角的状态点（颜色 = 所有会话里最要紧的状态）；没有可提醒的会话就是原图标
+        private void UpdateTrayDot(CacheState st)
+        {
+            if (tray == null || (int)st == trayDotKey)
+            {
+                return;
+            }
+            trayDotKey = (int)st;
+            try
+            {
+                Icon baseIcon = Icon ?? SystemIcons.Application;
+                using (Bitmap bmp = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    using (Bitmap src = baseIcon.ToBitmap())
+                    {
+                        g.DrawImage(src, 0, 0, 32, 32);
+                    }
+                    if (st != CacheState.None)
+                    {
+                        Color c = StateColor(st);
+                        using (SolidBrush ring = new SolidBrush(Color.FromArgb(50, 50, 50)))
+                        using (SolidBrush dot = new SolidBrush(Color.FromArgb(255, c)))
+                        {
+                            g.FillEllipse(ring, 14, 14, 18, 18);
+                            g.FillEllipse(dot, 16, 16, 14, 14);
+                        }
+                    }
+                    IntPtr h = bmp.GetHicon();
+                    tray.Icon = Icon.FromHandle(h);
+                    if (trayDotHandle != IntPtr.Zero)
+                    {
+                        DestroyIcon(trayDotHandle);
+                    }
+                    trayDotHandle = h;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private string CountText()
+        {
+            List<string> parts = new List<string>();
+            if (cUrgent > 0) parts.Add("红" + cUrgent);
+            if (cSoon > 0) parts.Add("黄" + cSoon);
+            if (cRunning > 0) parts.Add("绿" + cRunning);
+            if (cWaiting > 0) parts.Add("蓝" + cWaiting);
+            return string.Join(" ", parts.ToArray());
         }
 
         // 剩余时间：不到 1 小时写 m:ss，超过写 h:mm:ss
@@ -4636,10 +6278,29 @@ namespace Stilla
         // 右边四列靠右对齐
         private void DrawRowNumbers(Graphics g, float pad, float inner, float colW, float y, float h, string[] texts, Color color)
         {
-            float x = pad + colWidth[0] + colWidth[1];
+            int first = usageMode == 0 ? 4 : 3;        // 会话视图：第 3 列是「占用」，数字列从第 4 列开始
+            float x = pad;
+            for (int c = 0; c < first; c++)
+            {
+                x += colWidth[c];
+            }
             for (int k = 0; k < 4; k++)
             {
-                DrawTextRect(g, texts[k], fSmall, color, new RectangleF(x, y, colWidth[2 + k], h), StringAlignment.Far);
+                if (colWidth[first + k] >= 1f)
+                {
+                    DrawTextFit(g, texts[k], fSmall, color, new RectangleF(x, y, colWidth[first + k], h), StringAlignment.Far);
+                }
+                x += colWidth[first + k];
+            }
+        }
+
+        // 5 列数字（对比视图）：占第 2~6 列
+        private void DrawRowNumbers5(Graphics g, float pad, float inner, float colW, float y, float h, string[] texts, Color color)
+        {
+            float x = pad + colWidth[0] + colWidth[1];
+            for (int k = 0; k < 5; k++)
+            {
+                DrawTextFit(g, texts[k], fSmall, color, new RectangleF(x, y, colWidth[2 + k], h), StringAlignment.Far);
                 x += colWidth[2 + k];
             }
         }
@@ -4647,6 +6308,10 @@ namespace Stilla
         // 调用 scripts\sync_vscode_titles.py 导出 VS Code 里的会话标题。在后台线程里跑，最多等 60 秒，不卡界面
         private void StartVsCodeSync()
         {
+            if (ClaudeRoots.Isolated)
+            {
+                return;         // 演示 / 隔离模式：不去读真实的 VS Code 数据库
+            }
             string dir = AppPaths.DataDir;
             string script = AppPaths.Script("sync_vscode_titles.py");
             if (!File.Exists(script))
@@ -4758,20 +6423,29 @@ namespace Stilla
         {
             accountRect = RectangleF.Empty;
             string chip = AccountChipText();
-            if (chip.Length == 0 || !skin.ShowAccountChip)
+            if (chip.Length == 0 || !skin.ShowAccountChip || !Show(Feat.Chip))
             {
                 return;
             }
-            float cw = MeasureW(g, chip) + 14f * s;
+            bool dot = indicatorState != CacheState.None;           // 缓存状态点：所有会话里最要紧的状态的颜色
+            float dotW = dot ? 10f * s : 0f;
+            float cw = MeasureW(g, chip) + 14f * s + dotW;
             if (refreshRect.X - cw - 2f * s < pad + 100f * s && AccountStore.Current != null)
             {
                 chip = AccountStore.Current.Id;     // 窄了：只留编号
-                cw = MeasureW(g, chip) + 14f * s;
+                cw = MeasureW(g, chip) + 14f * s + dotW;
             }
             RectangleF r = new RectangleF(refreshRect.X - cw - 2f * s, 8f * s, cw, 18f * s);
             Color c = AccountStore.Current == null ? Amber : TextDim;
             SkinDraw.RrLine(g, c, r, 9f * s, 1f * s);
-            DrawTextRect(g, chip, fSmall, c, r, StringAlignment.Center);
+            if (dot)
+            {
+                using (SolidBrush db = new SolidBrush(StateColor(indicatorState)))
+                {
+                    g.FillEllipse(db, r.X + 7f * s, r.Y + r.Height / 2f - 3f * s, 6f * s, 6f * s);
+                }
+            }
+            DrawTextRect(g, chip, fSmall, c, new RectangleF(r.X + dotW, r.Y, r.Width - dotW, r.Height), StringAlignment.Center);
             accountRect = r;
         }
 
@@ -4884,7 +6558,7 @@ namespace Stilla
                 }
             }
             Account before = AccountStore.Current;
-            if (AccountStore.SetCurrent(a.Id, a.Plan, "自动识别"))
+            if (AccountStore.SetCurrent(a.Id, a.Plan, "自动识别", Path.Combine(AppPaths.DataDir, "额度快照.csv")))
             {
                 if (before != null && before.Id != a.Id)
                 {
@@ -5026,6 +6700,17 @@ namespace Stilla
             }
             items.Add(new ToolStripSeparator());
             items.Add("订阅视图", null, delegate
+            {
+                if (!showUsage)
+                {
+                    SetUsageVisible(true);
+                }
+                CollapseRows();
+                usageMode = 3;
+                Redraw();
+                SaveSettings();
+            });
+            items.Add("API 用量视图", null, delegate
             {
                 if (!showUsage)
                 {
@@ -5245,7 +6930,7 @@ namespace Stilla
                 Account a = items[i];
                 float ry = y + i * rowH;
                 double? cost = SubCost(a.Id);
-                skin.DrawShare(g, pad + 10f * s, ry + 2.5f * s, total > 0 && cost.HasValue ? Math.Min(1.0, cost.Value / total) : 0, curPal, s);
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, total > 0 && cost.HasValue ? Math.Min(1.0, cost.Value / total) : 0, curPal, s);
                 float nameX = pad + (skin.ShareWidth + 17f) * s;
                 float right = pad + nameW - 6f * s;
                 float x = a == cur ? DrawTierBadge(g, "当前", 4, right, ry, rowH, s) : right;
@@ -5270,10 +6955,140 @@ namespace Stilla
             return shown;
         }
 
+        // ---------------------------------------------------------------- API 视图
+        // 只统计「走 API 的非 Claude 模型」（本机日志里是 DeepSeek 等），Claude 的订阅用量不在这里。后台读一遍日志，最多 10 分钟一次
+        private void StartApiRefresh()
+        {
+            if (apiBusy || (apiRows != null && DateTime.UtcNow - apiRefreshUtc < TimeSpan.FromMinutes(10)))
+            {
+                return;
+            }
+            apiBusy = true;
+            apiRefreshUtc = DateTime.UtcNow;
+            string detail = logger.DetailPath;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<LogSummary.ApiTotal> res = null;
+                try
+                {
+                    res = LogSummary.ReadApiTotals(detail);
+                }
+                catch (Exception)
+                {
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (res != null)
+                        {
+                            apiRows = res;
+                        }
+                        apiBusy = false;
+                        Redraw();
+                    }));
+                }
+                catch (Exception)
+                {
+                    apiBusy = false;
+                }
+            });
+        }
+
+        // 估算费用（人民币）：目前只有 DeepSeek 有价格（闲时价，见 EstimateCostCny）；别的模型没价格就是 NaN
+        private static double ApiCostCny(LogSummary.ApiTotal a)
+        {
+            return a.Model.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase) ? EstimateCostCny(a.In, a.Out, a.Cw, a.Cr) : double.NaN;
+        }
+
+        private static string CnyText(double v)
+        {
+            return double.IsNaN(v) ? "—" : "¥" + v.ToString(v < 100 ? "0.00" : "0", CultureInfo.InvariantCulture);
+        }
+
+        private int DrawApiRows(Graphics g, float pad, float inner, float s, float colW, float nameW, float y, float rowH, int cap)
+        {
+            if (apiRows == null)
+            {
+                DrawTextRect(g, "正在统计日志里的 API 用量…", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return 1;
+            }
+            if (apiRows.Count == 0)
+            {
+                DrawTextRect(g, "日志里没有走 API 的非 Claude 模型用量", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return 1;
+            }
+            double total = 0;
+            foreach (LogSummary.ApiTotal a in apiRows)
+            {
+                double c = ApiCostCny(a);
+                total += double.IsNaN(c) ? 0 : c;
+            }
+            int shown = Math.Min(apiRows.Count, cap);
+            for (int i = 0; i < shown; i++)
+            {
+                LogSummary.ApiTotal a = apiRows[i];
+                float ry = y + i * rowH;
+                double cost = ApiCostCny(a);
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, total > 0 && !double.IsNaN(cost) ? Math.Min(1.0, cost / total) : 0, curPal, s);
+                float nameX = pad + (skin.ShareWidth + 17f) * s;
+                string span = a.First.ToString("MM-dd", CultureInfo.InvariantCulture) + "~" + a.Last.ToString("MM-dd", CultureInfo.InvariantCulture);
+                float sw = MeasureW(g, span) + 12f * s;
+                float right = pad + nameW - 6f * s;
+                DrawTextRect(g, span, fSmall, TextDim, new RectangleF(right - sw, ry, sw, rowH), StringAlignment.Far);
+                DrawTextFit(g, a.Model, fSmall, TextMain, new RectangleF(nameX, ry, Math.Max(24f * s, right - sw - 4f * s - nameX), rowH), StringAlignment.Near);
+                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+                {
+                    a.Msgs.ToString("N0", CultureInfo.InvariantCulture), UsageTracker.FormatTokens(a.In + a.Cw), UsageTracker.FormatTokens(a.Out), CnyText(cost)
+                }, TextMain);
+            }
+            return shown;
+        }
+
+        private void DrawApiInfo(Graphics g, float pad, float inner, float s, float y, float rowH)
+        {
+            tipInfoY = y;
+            tipInfoN = apiRows == null || apiRows.Count == 0 ? 0 : 3;
+            if (apiRows == null || apiRows.Count == 0)
+            {
+                DrawTextFit(g, "Claude 订阅用量看「订阅」视图；Anthropic 控制台的 API 用量需要 Admin Key，本机没有，查不到。", fSmall, TextDim,
+                    new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return;
+            }
+            long msgs = 0, inp = 0, outp = 0, cr = 0;
+            double total = 0;
+            bool unpriced = false;
+            foreach (LogSummary.ApiTotal a in apiRows)
+            {
+                msgs += a.Msgs;
+                inp += a.In + a.Cw;
+                outp += a.Out;
+                cr += a.Cr;
+                double c = ApiCostCny(a);
+                if (double.IsNaN(c))
+                {
+                    unpriced = true;
+                }
+                else
+                {
+                    total += c;
+                }
+            }
+            DrawTextFit(g, "合计 " + msgs.ToString("N0", CultureInfo.InvariantCulture) + " 条 · 输入 " + UsageTracker.FormatTokens(inp) + " · 输出 " + UsageTracker.FormatTokens(outp)
+                + " · 缓存命中 " + UsageTracker.FormatTokens(cr), fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, "估算 " + CnyText(total) + (unpriced ? "（有模型没价格，没算）" : "") + " · 按 DeepSeek 闲时价：输入 ¥" + DsMissPerM.ToString("0.##", CultureInfo.InvariantCulture)
+                + "、缓存命中 ¥" + DsHitPerM.ToString("0.##", CultureInfo.InvariantCulture) + "、输出 ¥" + DsOutPerM.ToString("0.##", CultureInfo.InvariantCulture) + " / 百万 token",
+                fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, "只统计非 Claude 模型的历史用量。Anthropic 控制台的 API 用量需要 Admin Key，本机没有，查不到。", fSmall, TextDim,
+                new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
+        }
+
         // 订阅视图底部：当前账号的订阅周期、本期用量折算、周额度用完预测
         private void DrawSubscriptionInfo(Graphics g, float pad, float inner, float s, float y, float rowH)
         {
             Account a = AccountStore.Current;
+            tipInfoY = y;
+            tipInfoN = a == null ? 0 : 3;
             if (a == null)
             {
                 DrawTextRect(g, "右键 → 账号与订阅 → 管理账号与订阅…，可以改名字、计划、月费、开始日期", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
@@ -5287,7 +7102,7 @@ namespace Stilla
             string l1 = a.Label + " · " + PlanInfo.NameOf(a.Plan) + " · "
                 + (a.Start == DateTime.MinValue ? "开始日期未知" : "订阅 " + a.Start.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " 起")
                 + " · 本期第 " + day + "/" + totalDays + " 天" + (cal ? "（按自然月）" : "，" + ce.ToString("MM-dd", CultureInfo.InvariantCulture) + " 续费");
-            DrawTextRect(g, l1, fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l1, fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
 
             double? cost = SubCost(a.Id);
             string l2;
@@ -5301,11 +7116,11 @@ namespace Stilla
                 l2 = "本期 API 等价 " + Money(c) + (a.Fee > 0 ? "（月费 " + Money(a.Fee) + " 的 ×" + (c / a.Fee).ToString(c / a.Fee < 10 ? "0.0" : "0", CultureInfo.InvariantCulture) + "）" : "")
                     + " · 日均 " + Money(c / day) + " · 整期约 " + Money(c / day * totalDays);
             }
-            DrawTextRect(g, l2, fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l2, fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
 
             bool risk;
             string l3 = WeeklyForecast(out risk);
-            DrawTextRect(g, l3, fSmall, risk ? Amber : TextDim, new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l3, fSmall, risk ? Amber : TextDim, new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
         }
 
         // 续费提醒：还有 3 天以内续费，托盘弹一次提示（每个周期一次）。订阅开始日期未知时不提醒
@@ -5391,6 +7206,8 @@ namespace Stilla
 
         private void NoteWeekly(FetchResult r)
         {
+            NoteFive(r);
+            CheckLimitWarn(r);
             if (r.SevenDay == null || !r.SevenDay.ResetsAt.HasValue)
             {
                 return;
@@ -5415,6 +7232,10 @@ namespace Stilla
 
         private static string HoursText(double h)
         {
+            if (!Finite(h))
+            {
+                return "—";
+            }
             if (h >= 48)
             {
                 return (h / 24).ToString("0.0", CultureInfo.InvariantCulture) + " 天";
@@ -5456,6 +7277,11 @@ namespace Stilla
                 }
             }
             string head = "周额度 " + pct.ToString("0", CultureInfo.InvariantCulture) + "%（" + HoursText(hoursLeft) + "后重置）";
+            if (pct >= 99.5)
+            {
+                risk = true;
+                return head + " · 已用满，等重置后恢复";
+            }
             if (p0 == null || (now - p0.T).TotalHours < 1.5)
             {
                 return head + " · 预测：数据还不够（需要至少 1.5 小时的采样）";
@@ -5528,6 +7354,10 @@ namespace Stilla
 
         private static string FormatPct(double pct, bool approx)
         {
+            if (!Finite(pct))
+            {
+                return "—";
+            }
             // 带「≈」的前缀占地方，小数少留一位
             string num = pct < 10 ? pct.ToString(approx ? "0.0" : "0.00", CultureInfo.InvariantCulture) : pct.ToString("0", CultureInfo.InvariantCulture);
             return (approx ? "≈" : "") + num + "%";
@@ -5641,118 +7471,6 @@ namespace Stilla
             return any && sum > 0 ? FormatPct(sum, approxAny) : "";
         }
 
-        // 每个基础模型在这个时段的额度估算（各档位加起来）
-        private void PerModelPct(UsageTracker.PeriodSummary cur, Dictionary<string, double> pct, Dictionary<string, bool> approx)
-        {
-            if (cur.TierRows.Count > 0)
-            {
-                foreach (TierItem it in BuildTierItems(cur))
-                {
-                    if (!it.HasPct)
-                    {
-                        continue;
-                    }
-                    double v;
-                    pct.TryGetValue(it.Model, out v);
-                    pct[it.Model] = v + it.Pct;
-                    approx[it.Model] = it.Approx;
-                }
-                return;
-            }
-            Dictionary<string, long[]> toks = new Dictionary<string, long[]>();
-            foreach (UsageTracker.ModelTotal mt in cur.ModelRows)
-            {
-                string key = BaseModel(mt.Model);
-                long[] tk;
-                if (!toks.TryGetValue(key, out tk))
-                {
-                    tk = new long[10];
-                    toks[key] = tk;
-                }
-                for (int i = 0; i < 10; i++)
-                {
-                    tk[i] += mt.Tok[i];
-                }
-            }
-            foreach (KeyValuePair<string, long[]> kv in toks)
-            {
-                double p;
-                bool a;
-                if (TryQuotaPct(kv.Key, kv.Value, false, out p, out a))
-                {
-                    pct[kv.Key] = p;
-                    approx[kv.Key] = a;
-                }
-            }
-        }
-
-        private string[] TierTotalNums(UsageTracker.PeriodSummary cur)
-        {
-            long msgs = 0, outp = 0, think = 0;
-            foreach (UsageTracker.TierTotal tt in cur.TierRows)
-            {
-                msgs += tt.Msgs;
-                outp += tt.Out;
-                think += tt.Think;
-            }
-            return new string[] { UsageTracker.FormatTokens(msgs), UsageTracker.FormatTokens(outp), UsageTracker.FormatTokens(think), TotalEstimateText(cur, false) };
-        }
-
-        // 档位视图：每个「模型 × 档位」一行。档位 = 思考强度（low / medium / high / xhigh / max）；开着 Ultracode 的消息单独算 ultra；
-        // 快速模式后面加 +fast；记录里没有标注的叫「未标注」。条数 = API 消息数；输出含思考；5h估算 = 折算的额度
-        private int DrawTierRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
-            float colW, float nameW, float y, float rowH, int cap)
-        {
-            LoadQuota();
-            List<TierItem> items = BuildTierItems(cur);
-            if (items.Count == 0)
-            {
-                DrawTextRect(g, "这段时间内没有用量", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
-                return 1;
-            }
-            double sumPct = 0;
-            long sumTotal = 0;
-            foreach (TierItem it in items)
-            {
-                sumPct += it.Pct;
-                sumTotal += it.Total;
-            }
-            int shown = items.Count <= cap ? items.Count : cap - 1;
-            int drawn = 0;
-            for (int i = 0; i < shown; i++)
-            {
-                TierItem it = items[i];
-                float ry = y + drawn * rowH;
-                double share = sumPct > 0 ? it.Pct / sumPct : ShareOf(it.Total, sumTotal);
-                skin.DrawShare(g, pad + 6f * s, ry + 2.5f * s, share, curPal, s);
-                float nameX = pad + (skin.ShareWidth + 13f) * s;
-                DrawTextRect(g, it.Model.Replace("claude-", "") + " " + it.Tier, fSmall, TextMain,
-                    new RectangleF(nameX, ry, nameW - (nameX - pad), rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
-                {
-                    UsageTracker.FormatTokens(it.Msgs), UsageTracker.FormatTokens(it.Out), UsageTracker.FormatTokens(it.Think),
-                    it.HasPct ? FormatPct(it.Pct, it.Approx) : "—"
-                }, TextMain);
-                drawn++;
-            }
-            if (shown < items.Count)
-            {
-                long rm = 0, ro = 0, rt = 0;
-                for (int i = shown; i < items.Count; i++)
-                {
-                    rm += items[i].Msgs;
-                    ro += items[i].Out;
-                    rt += items[i].Think;
-                }
-                DrawTextRect(g, "其他 " + (items.Count - shown) + " 个", fSmall, TextDim,
-                    new RectangleF(pad + 4f * s, y + drawn * rowH, nameW - 4f * s, rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, y + drawn * rowH, rowH,
-                    new string[] { UsageTracker.FormatTokens(rm), UsageTracker.FormatTokens(ro), UsageTracker.FormatTokens(rt), "" }, TextDim);
-                drawn++;
-            }
-            return drawn;
-        }
-
         // 档位的高低（标签样式用）：low < medium < high < xhigh < max < ultra
         private static int TierRank(string tier)
         {
@@ -5782,6 +7500,36 @@ namespace Stilla
         private float MeasureW(Graphics g, string text)
         {
             return g.MeasureString(text, fSmall, 4096, StringFormat.GenericTypographic).Width;
+        }
+
+        // the width DrawString compares with the rectangle (MeasureW without the left and right padding); wider text is cut to "xxx..."
+        private float TextW(Graphics g, string text, Font font)
+        {
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+                return g.MeasureString(text, font, 100000, sf).Width;
+            }
+        }
+
+        // vertical column dividers, from the header down to bottom
+        private void DrawDividers(Graphics g, float bottom)
+        {
+            colBottom = bottom;
+            if (usageMode >= 3)
+            {
+                return;
+            }
+            using (Pen divPen = new Pen(Track))
+            {
+                for (int i = FirstEdge(); i < 7; i++)
+                {
+                    if (colOn[i] && colNext[i] >= 0)
+                    {
+                        g.DrawLine(divPen, colEdgeX[i], colTop, colEdgeX[i], bottom);
+                    }
+                }
+            }
         }
 
         // 档位小标签（右边缘对齐到 rightX），返回标签的左边缘。low~high：虚线框淡色字；xhigh：实线框；max：实心；ultra：实心橙色。文字空 = 不画
@@ -5880,13 +7628,13 @@ namespace Stilla
             return a.ToString(f, CultureInfo.InvariantCulture) + "–" + b.ToString(f, CultureInfo.InvariantCulture);
         }
 
-        // 模型视图：每个会话一行（▸ 点开是它用过的每个 模型 × 档位）。token 是实际数据；「估算」是折算出的额度，只供参考
+        // 模型视图：每个会话一行，行尾是模型和档位标签；点一行弹出详情小窗（每个 模型 × 档位 的详细数据和切换记录）。
+        // token 是实际数据；「估算」是折算出的额度，只供参考
         private int DrawModelRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float y, float rowH, int cap)
         {
             LoadQuota();
-            chevHits.Clear();
-            List<ModelLine> items = BuildModelLines(cur);
+            List<ModelGroup> items = BuildModelGroups(cur);
             if (items.Count == 0)
             {
                 DrawTextRect(g, "这段时间内没有模型用量", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
@@ -5898,32 +7646,19 @@ namespace Stilla
             int drawn = 0;
             for (int i = rowStart; i < rowStart + rowShown; i++)
             {
-                ModelLine ln = items[i];
                 float ry = y + drawn * rowH;
-                if (ln.Part == null)
-                {
-                    DrawModelGroupRow(g, ln, cur, pad, inner, s, colW, nameW, ry, rowH);
-                }
-                else
-                {
-                    DrawModelPartRow(g, ln.Part, pad, inner, s, colW, nameW, ry, rowH);
-                }
-                sessionHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad, ry, inner, rowH), ln.Group.Session));
+                DrawModelGroupRow(g, items[i], cur, pad, inner, s, colW, nameW, ry, rowH);
+                sessionHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad, ry, inner, rowH), items[i].Session));
                 drawn++;
             }
             if (rowMore)
             {
                 long rest = 0;
-                int groupsLeft = 0;
                 for (int i = rowShown; i < items.Count; i++)
                 {
-                    if (items[i].Part == null)
-                    {
-                        rest += items[i].Group.Total;
-                        groupsLeft++;
-                    }
+                    rest += items[i].Total;
                 }
-                DrawMoreRow(g, "▾ 其他 " + (groupsLeft > 0 ? groupsLeft + " 个" : (items.Count - rowShown) + " 行"),
+                DrawMoreRow(g, "▾ 其他 " + (items.Count - rowShown) + " 个",
                     new string[] { UsageTracker.FormatTokens(rest), "", "", "" }, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
                 drawn++;
             }
@@ -5935,17 +7670,15 @@ namespace Stilla
             return drawn;
         }
 
-        // 会话行：[▸] 小圆 标题 ……… 模型 [档位]。窄的时候先丢模型名，再把「xhigh→max」缩成「…→max」，标题最少留 70 个基础单位
-        private void DrawModelGroupRow(Graphics g, ModelLine ln, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
+        // 会话行：[▾] 小圆 标题 ……… 模型 [档位]。▾ = 这段时间里换过模型或档位，点开小窗能看到每一段。窄的时候先丢模型名，再把「xhigh→max」缩成「…→max」
+        private void DrawModelGroupRow(Graphics g, ModelGroup grp, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float ry, float rowH)
         {
-            ModelGroup grp = ln.Group;
             if (grp.Parts.Count > 1)
             {
-                DrawTextRect(g, ln.Expanded ? "▾" : "▸", fSmall, Accent, new RectangleF(pad - 2f * s, ry, 13f * s, rowH), StringAlignment.Center);
-                chevHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad - 4f * s, ry, 26f * s, rowH), grp.Session));
+                DrawTextRect(g, "▾", fSmall, Accent, new RectangleF(pad - 2f * s, ry, 13f * s, rowH), StringAlignment.Center);
             }
-            skin.DrawShare(g, pad + 10f * s, ry + 2.5f * s, ShareOf(grp.Total, cur.Total), curPal, s);
+            skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, ShareOf(grp.Total, cur.Total), curPal, s);
             float nameX = pad + (skin.ShareWidth + 17f) * s;
             string modelText, tierText;
             int rank;
@@ -5972,135 +7705,336 @@ namespace Stilla
             }, TextMain);
         }
 
-        // 展开后的子行：缩进到小圆的位置，└ 模型 时间段 ……… [档位]；放不下时先丢时间段
-        private void DrawModelPartRow(Graphics g, UsageTracker.ModelTotal mt, float pad, float inner, float s,
-            float colW, float nameW, float ry, float rowH)
+        // ---------------------------------------------------------------- 详情小窗（点模型视图里的会话）
+        private bool TierPct(string model, string tier, long[] tok, bool week, out double pct, out bool approx)
         {
-            float textX = pad + 24f * s;
-            DrawTextRect(g, "└", fSmall, TextDim, new RectangleF(pad + 10f * s, ry, 12f * s, rowH), StringAlignment.Center);
-            float right = pad + nameW - 6f * s;
-            float x = DrawTierBadge(g, mt.Tier == "未标注" ? "" : mt.Tier, TierRank(mt.Tier), right, ry, rowH, s);
-            float avail = x - 6f * s - textX;
-            string model = ShortModel(mt.Model);
-            string full = model + "  " + SpanText(mt.FirstUtc, mt.LastUtc);
-            DrawTextRect(g, MeasureW(g, full) + 4f * s <= avail ? full : model, fSmall, TextDim,
-                new RectangleF(textX, ry, Math.Max(24f * s, avail), rowH), StringAlignment.Near);
-            DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+            if (!TryQuotaPct(model, tok, week, out pct, out approx))
             {
-                UsageTracker.FormatTokens(mt.Total), PartEstimate(mt, false), PartEstimate(mt, true), UsageTracker.FormatTokens(mt.CacheRead)
-            }, TextDim);
+                return false;
+            }
+            pct *= quota.TierFactor(tier, week);
+            return true;
         }
 
-        // 对比视图：把所有会话按模型合并，看每个模型用了多少 token、占比多少；「5h估算」是它在这段时间里消耗的 5 小时额度百分点
-        // （按官方价格折算成美元，再乘以每美元消耗的额度百分点，系数由 额度换算.py 用额度快照拟合）；
-        // 「倍数」= 它每百万 token 消耗的额度% ÷ 这几个模型里最便宜的那个（同样多的 token，比最便宜的多耗几倍额度）。
-        // 「≈」= 这个模型没有实测过，按官方价格推算；「—」= 没有这个模型的价格
+        private double? UsdOf(string model, long[] tok)
+        {
+            QuotaTable.Entry e;
+            if (quota != null && quota.Models.TryGetValue(BaseModel(model), out e))
+            {
+                return quota.CostUsdAt(e, tok, 1.0);
+            }
+            return null;
+        }
+
+        private static string UsdText(double v)
+        {
+            if (!Finite(v))
+            {
+                return "—";
+            }
+            return v >= 1000 ? "$" + (v / 1000).ToString("0.0", CultureInfo.InvariantCulture) + "k"
+                : v >= 100 ? "$" + v.ToString("0", CultureInfo.InvariantCulture) : "$" + v.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private DetailRow MakeDetailRow(string model, string tier, string span, long msgs, long[] tok, long think, bool sub)
+        {
+            DetailRow r = new DetailRow();
+            r.Tier = tier;
+            r.Rank = TierRank(tier);
+            r.Model = ShortModel(model) + (sub ? " ·子任务" : "");
+            r.Span = span;
+            r.Msgs = msgs;
+            r.In = tok[0] + tok[5];
+            r.Out = tok[1] + tok[6];
+            r.Think = think;
+            r.Cw = tok[2] + tok[3] + tok[7] + tok[8];
+            r.Cr = tok[4] + tok[9];
+            double p;
+            bool ap;
+            if (TierPct(model, tier, tok, false, out p, out ap))
+            {
+                r.Pct5 = FormatPct(p, ap);
+            }
+            if (TierPct(model, tier, tok, true, out p, out ap))
+            {
+                r.PctW = FormatPct(p, ap);
+            }
+            double? usd = UsdOf(model, tok);
+            if (usd.HasValue)
+            {
+                r.Usd = UsdText(usd.Value);
+            }
+            return r;
+        }
+
+        private static string SpanLocal(DateTime a, DateTime b)
+        {
+            string f = a.Date == b.Date && a.Date == DateTime.Today ? "HH:mm" : "MM-dd HH:mm";
+            return a.ToString(f, CultureInfo.InvariantCulture) + "–" + b.ToString(f, CultureInfo.InvariantCulture);
+        }
+
+        // 做出这个会话的详情小窗：上面是每个 模型 × 档位 的汇总（带合计），下面（换过档位 / 模型时）是按时间先后的切换记录
+        private DetailPopup MakeTierPopup(ModelGroup grp, UsageTracker.PeriodSummary cur, List<SessionRun> runs)
+        {
+            LoadQuota();
+            List<DetailRow> tiers = new List<DetailRow>();
+            DetailRow total = new DetailRow();
+            total.Bold = true;
+            total.Tier = "合计";
+            long[] sumTok = new long[10];
+            double s5 = 0, sw = 0, usdSum = 0;
+            bool any5 = false, anyW = false, ap5 = false, apW = false, anyUsd = false;
+            DateTime first = DateTime.MaxValue, last = DateTime.MinValue;
+            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+            {
+                tiers.Add(MakeDetailRow(mt.Model, mt.Tier, SpanText(mt.FirstUtc, mt.LastUtc), mt.Msgs, mt.Tok, mt.Think, false));
+                double p;
+                bool ap;
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, false, out p, out ap))
+                {
+                    s5 += p;
+                    any5 = true;
+                    ap5 = ap5 || ap;
+                }
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, true, out p, out ap))
+                {
+                    sw += p;
+                    anyW = true;
+                    apW = apW || ap;
+                }
+                double? usd = UsdOf(mt.Model, mt.Tok);
+                if (usd.HasValue)
+                {
+                    usdSum += usd.Value;
+                    anyUsd = true;
+                }
+                for (int i = 0; i < 10; i++)
+                {
+                    sumTok[i] += mt.Tok[i];
+                }
+                total.Msgs += mt.Msgs;
+                total.Think += mt.Think;
+                if (mt.FirstUtc < first)
+                {
+                    first = mt.FirstUtc;
+                }
+                if (mt.LastUtc > last)
+                {
+                    last = mt.LastUtc;
+                }
+            }
+            total.Span = SpanText(first, last);
+            total.In = sumTok[0] + sumTok[5];
+            total.Out = sumTok[1] + sumTok[6];
+            total.Cw = sumTok[2] + sumTok[3] + sumTok[7] + sumTok[8];
+            total.Cr = sumTok[4] + sumTok[9];
+            if (any5)
+            {
+                total.Pct5 = FormatPct(s5, ap5);
+            }
+            if (anyW)
+            {
+                total.PctW = FormatPct(sw, apW);
+            }
+            if (anyUsd)
+            {
+                total.Usd = UsdText(usdSum);
+            }
+            tiers.Add(total);
+
+            List<DetailRow> runRows = null;
+            int hidden = 0;
+            if (runs != null && runs.Count > 0 && grp.Parts.Count > 1)
+            {
+                List<SessionRun> mainRuns = new List<SessionRun>();
+                List<SessionRun> subRuns = new List<SessionRun>();
+                foreach (SessionRun r in runs)
+                {
+                    (r.Sub ? subRuns : mainRuns).Add(r);
+                }
+                const int maxRuns = 20;
+                if (mainRuns.Count > maxRuns)
+                {
+                    hidden = mainRuns.Count - maxRuns;
+                    mainRuns.RemoveRange(0, hidden);
+                }
+                runRows = new List<DetailRow>();
+                foreach (SessionRun r in mainRuns)
+                {
+                    runRows.Add(MakeDetailRow(r.Model, r.Tier, SpanLocal(r.First, r.Last), r.Msgs, r.Tok, r.Think, false));
+                }
+                foreach (SessionRun r in subRuns)
+                {
+                    runRows.Add(MakeDetailRow(r.Model, r.Tier, SpanLocal(r.First, r.Last), r.Msgs, r.Tok, r.Think, true));
+                }
+            }
+
+            PopupColors pc = new PopupColors();
+            pc.Bg = Color.FromArgb(255, Bg);
+            pc.Main = Color.FromArgb(255, TextMain);
+            pc.Dim = Color.FromArgb(255, TextDim);
+            pc.Track = Color.FromArgb(255, SkinDraw.Mix(Bg, TextDim, 0.35f));
+            pc.Border = Color.FromArgb(255, SkinDraw.Mix(Bg, TextDim, 0.6f));
+            pc.Amber = Color.FromArgb(255, Amber);
+            string session = grp.Session;
+            return new DetailPopup(SessionTitle(session), cur.Label + "  " + cur.Range, tiers, runRows, hidden, pc, skin.UiFamily, scale,
+                delegate { OpenDrill(session); });
+        }
+
+        // 点会话行：后台读这个会话的切换记录，读好后在行的下方弹出详情小窗（再点同一行 = 收起；点别处 / Esc / × 也收起）
+        private void ShowTierPopup(string session, RectangleF rowRect)
+        {
+            bool same = tierPopup != null && !tierPopup.IsDisposed && tierPopupSession == session;
+            if (tierPopup != null && !tierPopup.IsDisposed)
+            {
+                tierPopup.Close();
+            }
+            tierPopup = null;
+            if (same)
+            {
+                tierPopupSession = "";
+                return;
+            }
+            UsageTracker.PeriodSummary cur = PeriodFor(usagePeriod);
+            ModelGroup grp = null;
+            foreach (ModelGroup x in BuildModelGroups(cur))
+            {
+                if (x.Session == session)
+                {
+                    grp = x;
+                    break;
+                }
+            }
+            if (grp == null)
+            {
+                return;
+            }
+            DateTime from = cur.From, to = cur.To;
+            string detail = logger.DetailPath;
+            Point below = PointToScreen(new Point((int)rowRect.X, (int)rowRect.Bottom));
+            int rowTop = PointToScreen(new Point((int)rowRect.X, (int)rowRect.Y)).Y;
+            tierPopupSession = session;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<SessionRun> runs = null;
+                try
+                {
+                    runs = LogSummary.ReadRuns(detail, session, from, to);
+                }
+                catch (Exception)
+                {
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (tierPopupSession != session)
+                        {
+                            return;
+                        }
+                        try
+                        {
+                            DetailPopup pop = MakeTierPopup(grp, cur, runs);
+                            Rectangle wa = Screen.FromControl(this).WorkingArea;
+                            int x = Math.Max(wa.Left, Math.Min(Left, wa.Right - pop.Width));
+                            int yTop = below.Y + 2;
+                            if (yTop + pop.Height > wa.Bottom)
+                            {
+                                yTop = Math.Max(wa.Top, rowTop - pop.Height - 2);
+                            }
+                            pop.Location = new Point(x, yTop);
+                            tierPopup = pop;
+                            pop.Show(this);
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }));
+                }
+                catch (Exception)
+                {
+                }
+            });
+        }
+
+        // 对比视图（模型 × 档位）：每个「模型 + 档位」一行，把所有会话合起来。token 是实际数据；「5h估算」是折算出的额度百分点；
+        // 「倍数」= 它每百万 token 消耗的额度% ÷ 这些行里最便宜的那个（同样多的 token，比最便宜的多耗几倍额度）。
+        // 「≈」= 这个模型没有实测过，按官方价格推算；「—」= 没有这个模型的价格。小圆点的大小是它占的额度比例
         private int DrawCompareRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float y, float rowH, int cap)
         {
             LoadQuota();
-            Dictionary<string, long> byModel = new Dictionary<string, long>();
-            Dictionary<string, long[]> byTok = new Dictionary<string, long[]>();
-            long all = 0;
-            foreach (UsageTracker.ModelTotal mt in cur.ModelRows)
-            {
-                string key = BaseModel(mt.Model);
-                long sum;
-                byModel.TryGetValue(key, out sum);
-                byModel[key] = sum + mt.Total;
-                long[] tok;
-                if (!byTok.TryGetValue(key, out tok))
-                {
-                    tok = new long[10];
-                    byTok[key] = tok;
-                }
-                for (int i = 0; i < 10; i++)
-                {
-                    tok[i] += mt.Tok[i];
-                }
-                all += mt.Total;
-            }
-            if (byModel.Count == 0)
+            List<TierItem> items = BuildTierItems(cur);
+            if (items.Count == 0)
             {
                 DrawTextRect(g, "这段时间内没有模型用量", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
                 return 1;
             }
-            List<KeyValuePair<string, long>> items = new List<KeyValuePair<string, long>>(byModel);
-            items.Sort(delegate(KeyValuePair<string, long> a, KeyValuePair<string, long> b) { return b.Value.CompareTo(a.Value); });
-
-            // 每百万 token 的 5 小时额度%，最便宜的作为 1 倍
             double cheapest = 0;
             bool cheapestApprox = false;
-            Dictionary<string, double> pctBy = new Dictionary<string, double>();
-            Dictionary<string, bool> apprBy = new Dictionary<string, bool>();
-            PerModelPct(cur, pctBy, apprBy);
-            Dictionary<string, double> rate = new Dictionary<string, double>();
-            Dictionary<string, bool> rateApprox = new Dictionary<string, bool>();
-            foreach (KeyValuePair<string, long> kv in items)
+            Dictionary<TierItem, double> rate = new Dictionary<TierItem, double>();
+            double sumPct = 0;
+            long sumTotal = 0;
+            foreach (TierItem it in items)
             {
-                double pct;
-                if (kv.Value > 0 && pctBy.TryGetValue(kv.Key, out pct) && pct > 0)
+                sumTotal += it.Total;
+                if (it.HasPct)
                 {
-                    bool approx = apprBy[kv.Key];
-                    double r = pct / (kv.Value / 1000000.0);
-                    rate[kv.Key] = r;
-                    rateApprox[kv.Key] = approx;
+                    sumPct += it.Pct;
+                }
+                if (it.HasPct && it.Pct > 0 && it.Total > 0)
+                {
+                    double r = it.Pct / (it.Total / 1000000.0);
+                    rate[it] = r;
                     if (cheapest == 0 || r < cheapest)
                     {
                         cheapest = r;
-                        cheapestApprox = approx;
+                        cheapestApprox = it.Approx;
                     }
                 }
             }
-
-            // 占比 = 这个模型的额度估算占所有模型额度估算的比例（没有换算时才退回 token 占比）
-            double sumPct = 0;
-            foreach (KeyValuePair<string, double> kv in pctBy)
+            if (sortCol[2] >= 0)
             {
-                sumPct += kv.Value;
+                ApplyCompareSort(items, rate);
             }
             int shown = items.Count <= cap ? items.Count : cap - 1;
-            int drawn = 0;
             for (int i = 0; i < shown; i++)
             {
-                string model = items[i].Key;
-                long tokens = items[i].Value;
-                float ry = y + drawn * rowH;
-                double myPct;
-                bool byQuota = sumPct > 0 && pctBy.TryGetValue(model, out myPct);
-                myPct = byQuota ? pctBy[model] : 0;
-                skin.DrawShare(g, pad + 6f * s, ry + 2.5f * s, byQuota ? myPct / sumPct : ShareOf(items[i].Value, all), curPal, s);
-                float nameX = pad + (skin.ShareWidth + 13f) * s;
-                DrawTextRect(g, model.Replace("claude-", ""), fSmall, TextMain, new RectangleF(nameX, ry, nameW - (nameX - pad), rowH), StringAlignment.Near);
+                TierItem it = items[i];
+                float ry = y + i * rowH;
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, sumPct > 0 ? Math.Min(1.0, it.Pct / sumPct) : ShareOf(it.Total, sumTotal), curPal, s);
+                float nameX = pad + (skin.ShareWidth + 17f) * s;
+                float right = pad + nameW - 6f * s;
+                float x = DrawTierBadge(g, it.Tier == "未标注" ? "" : it.Tier, TierRank(it.Tier), right, ry, rowH, s);
+                DrawTextRect(g, ShortModel(it.Model), fSmall, TextMain, new RectangleF(nameX, ry, Math.Max(24f * s, x - 6f * s - nameX), rowH), StringAlignment.Near);
                 string multiple = "—";
                 double rt;
-                if (rate.TryGetValue(model, out rt) && cheapest > 0)
+                if (rate.TryGetValue(it, out rt) && cheapest > 0)
                 {
                     double m = rt / cheapest;
-                    multiple = ((rateApprox[model] || cheapestApprox) && m > 1.0001 ? "≈×" : "×")
+                    multiple = ((it.Approx || cheapestApprox) && m > 1.0001 ? "≈×" : "×")
                         + (m < 10 ? m.ToString("0.0", CultureInfo.InvariantCulture) : m.ToString("0", CultureInfo.InvariantCulture));
                 }
-                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+                DrawRowNumbers5(g, pad, inner, colW, ry, rowH, new string[]
                 {
-                    UsageTracker.FormatTokens(tokens), byQuota ? (myPct * 100.0 / sumPct).ToString("0.0", CultureInfo.InvariantCulture) + "%" : Share(tokens, all),
-                    pctBy.ContainsKey(model) ? FormatPct(pctBy[model], apprBy[model]) : "—", multiple
+                    UsageTracker.FormatTokens(it.Total), UsageTracker.FormatTokens(it.Out), UsageTracker.FormatTokens(it.Think),
+                    it.HasPct ? FormatPct(it.Pct, it.Approx) : "—", multiple
                 }, TextMain);
-                drawn++;
             }
             if (shown < items.Count)
             {
                 long rest = 0;
                 for (int i = shown; i < items.Count; i++)
                 {
-                    rest += items[i].Value;
+                    rest += items[i].Total;
                 }
-                DrawTextRect(g, "其他 " + (items.Count - shown) + " 个", fSmall, TextDim,
-                    new RectangleF(pad + 4f * s, y + drawn * rowH, nameW - 4f * s, rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, y + drawn * rowH, rowH,
-                    new string[] { UsageTracker.FormatTokens(rest), sumPct > 0 ? "" : Share(rest, all), "", "" }, TextDim);
-                drawn++;
+                float ry = y + shown * rowH;
+                tipRowsOther = true;
+                DrawTextRect(g, "其他 " + (items.Count - shown) + " 个", fSmall, TextDim, new RectangleF(pad + 4f * s, ry, nameW - 4f * s, rowH), StringAlignment.Near);
+                DrawRowNumbers5(g, pad, inner, colW, ry, rowH, new string[] { UsageTracker.FormatTokens(rest), "", "", "", "" }, TextDim);
+                return shown + 1;
             }
-            return drawn;
+            return shown;
         }
 
         private static string Share(long part, long all)
@@ -6201,6 +8135,9 @@ namespace Stilla
             {
                 return;
             }
+#if UICHECK
+            UiProbe.Text(g, text, font, rect, align);       // layout check: compiled only into tools/ui-check Harness, not in release builds
+#endif
             using (StringFormat sf = new StringFormat())
             {
                 sf.Alignment = align;
@@ -6223,6 +8160,31 @@ namespace Stilla
                 {
                     g.DrawString(text, font, b, rect, sf);
                 }
+            }
+        }
+
+        // like DrawTextRect, but text that is too wide first gets a smaller font (down to minK times the size) and only then an ellipsis
+        private void DrawTextFit(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align)
+        {
+            DrawTextFit(g, text, font, color, rect, align, 0.78f);
+        }
+
+        private void DrawTextFit(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align, float minK)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+            float need = TextW(g, text, font);
+            if (need <= rect.Width + 0.5f || rect.Width <= 1f)
+            {
+                DrawTextRect(g, text, font, color, rect, align);
+                return;
+            }
+            float k = Math.Max(minK, rect.Width / need * 0.985f);
+            using (Font small = new Font(font.FontFamily, font.Size * k, font.Style, font.Unit))
+            {
+                DrawTextRect(g, text, small, color, rect, align);
             }
         }
 
@@ -6256,9 +8218,22 @@ namespace Stilla
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (resizing || colDrag >= 0 || rowDrag)
+            {
+                TipReset();
+            }
+            else
+            {
+                TipMove(e.Location);        // 悬停说明
+            }
             if (resizing)
             {
                 DoResize();
+                return;
+            }
+            if (rowDrag)
+            {
+                DoRowDrag(e.Y);
                 return;
             }
             if (colDrag >= 0)
@@ -6271,6 +8246,11 @@ namespace Stilla
                 Cursor = Cursors.SizeWE;
                 return;
             }
+            if (GripAt(e.Location))
+            {
+                Cursor = System.Windows.Forms.Cursors.SizeNS;
+                return;
+            }
             int edge = EdgeAt(e.Location);
             if (edge != 0)
             {
@@ -6278,7 +8258,7 @@ namespace Stilla
             }
             else
             {
-                Cursor = (closeRect.Contains(e.Location) || refreshRect.Contains(e.Location) || TabAt(e.Location) >= 0 || SegAt(e.Location) >= 0 || (showUsage && moreRect.Contains(e.Location)) || SessionAt(e.Location) != null || accountRect.Contains(e.Location) || toggleRect.Contains(e.Location) || (!badgeRect.IsEmpty && badgeRect.Contains(e.Location))) ? Cursors.Hand : Cursors.Default;
+                Cursor = (closeRect.Contains(e.Location) || refreshRect.Contains(e.Location) || TabAt(e.Location) >= 0 || SegAt(e.Location) >= 0 || (showUsage && moreRect.Contains(e.Location)) || SessionAt(e.Location) != null || accountRect.Contains(e.Location) || toggleRect.Contains(e.Location) || (!badgeRect.IsEmpty && badgeRect.Contains(e.Location)) || HeadAt(e.Location) >= 0 || JumpAt(e.Location) != null || TrendTabAt(e.Location) >= 0 || (showUsage && (healthRect.Contains(e.Location) || tabMoreRect.Contains(e.Location) || pauseRect.Contains(e.Location) || mailBtnRect.Contains(e.Location)))) ? Cursors.Hand : Cursors.Default;
             }
         }
 
@@ -6300,6 +8280,7 @@ namespace Stilla
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            TipClicked();
             if (e.Button != MouseButtons.Left)
             {
                 return;
@@ -6330,6 +8311,12 @@ namespace Stilla
                 SetUsageVisible(!showUsage);
                 return;
             }
+            // 时间标签条最右边的「⋯」：选择显示哪些时间标签，以及其他快捷设置
+            if (showUsage && tabMoreRect.Contains(e.Location))
+            {
+                ShowTabMenu();
+                return;
+            }
             // 点击用量面板顶部的时间段标签，切换显示
             if (showUsage)
             {
@@ -6354,9 +8341,69 @@ namespace Stilla
             {
                 colDrag = divider;
                 colDragX0 = e.X;
-                Array.Copy(colFr, colDragStart, 6);
+                Array.Copy(colFr, colDragStart, 8);
                 Capture = true;
                 return;
+            }
+            // 「合计」上面的分隔线：上下拖动调整行距；双击恢复默认
+            if (GripAt(e.Location))
+            {
+                if (e.Clicks >= 2)
+                {
+                    rowHu = RowHuDefault;
+                    Redraw();
+                    SaveSettings();
+                    return;
+                }
+                rowDrag = true;
+                rowDragY0 = e.Y;
+                rowDragH0 = rowHu;
+                rowDragN = Math.Max(1, gripRows);
+                Capture = true;
+                return;
+            }
+            // 趋势图右上角的 24小时 / 7天；合计行里的估算自检提示
+            if (showUsage && usageMode == 5)
+            {
+                int tt = TrendTabAt(e.Location);
+                if (tt >= 0)
+                {
+                    trendRange = tt;
+                    trendKey = "";
+                    Redraw();
+                    SaveSettings();
+                    return;
+                }
+            }
+            if (showUsage && pauseRect.Contains(e.Location))
+            {
+                TogglePause();
+                return;
+            }
+            if (showUsage && usageMode == 0 && mailBtnRect.Contains(e.Location))
+            {
+                OpenMailForm();
+                return;
+            }
+            if (showUsage && healthRect.Contains(e.Location))
+            {
+                ShowHealthDialog();
+                return;
+            }
+            // 点表头：「速度」的文字 = 选统计窗口；其他（含右侧小三角）= 按这一列排序
+            if (showUsage && usageMode <= 2)
+            {
+                if (usageMode == 0 && (speedHeadRect.Contains(e.Location) || occHeadRect.Contains(e.Location)))
+                {
+                    ShowSpeedMenu(speedHeadRect.Contains(e.Location) ? speedHeadRect : occHeadRect);      // 「速度」和「占用」用同一个统计窗口
+                    return;
+                }
+                int headCol = HeadAt(e.Location);
+                if (headCol >= 0)
+                {
+                    ToggleSort(headCol);
+                    return;
+                }
             }
             // 点击面板里表头的标题：依次切换 会话 → 模型 → 对比
             if (showUsage && SegAt(e.Location) >= 0)
@@ -6367,22 +8414,8 @@ namespace Stilla
                 SaveSettings();
                 return;
             }
-            // 模型视图里点会话行首的 ▸ / ▾：展开或折叠它用过的 模型 × 档位（优先于「点会话行打开明细」）
-            if (showUsage && usageMode == 1)
-            {
-                string chev = ChevronAt(e.Location);
-                if (chev != null)
-                {
-                    if (!expandedGroups.Remove(chev))
-                    {
-                        expandedGroups.Add(chev);
-                    }
-                    Redraw();
-                    return;
-                }
-            }
             // 订阅视图里点账号行：把统计切到这个账号（登录绑定了别的账号时会说明原因）
-            if (showUsage && usageMode == 4)
+            if (showUsage && usageMode == 3)
             {
                 foreach (KeyValuePair<RectangleF, string> h in accountHits)
                 {
@@ -6399,11 +8432,35 @@ namespace Stilla
                 ToggleRows();
                 return;
             }
-            // 点击用量面板里的会话行：打开它的明细
+            // 会话视图里点名字右边的 ↗：跳到这个会话所在的窗口
+            if (showUsage && usageMode == 0)
+            {
+                UsageTracker.SessionTotal jt = JumpAt(e.Location);
+                if (jt != null)
+                {
+                    JumpToSession(jt);
+                    return;
+                }
+            }
+            // 点击用量面板里的会话行：模型视图弹出详情小窗（每个档位的详细数据），其他视图打开它的明细
             string hitSession = SessionAt(e.Location);
             if (hitSession != null)
             {
-                OpenDrill(hitSession);
+                if (usageMode == 1)
+                {
+                    foreach (KeyValuePair<RectangleF, string> h in sessionHits)
+                    {
+                        if (h.Key.Contains(e.Location))
+                        {
+                            ShowTierPopup(hitSession, h.Key);
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    OpenDrill(hitSession);
+                }
                 return;
             }
             // 按在窗口边缘：拖动可以调整大小（上下左右和四个角）
@@ -6426,7 +8483,20 @@ namespace Stilla
         // 用量统计放到后台线程做，避免第一次读取较大的历史文件时卡住界面；同一时间只跑一个
         private void RefreshUsage()
         {
-            if (!showUsage || Interlocked.CompareExchange(ref usageBusy, 1, 0) != 0)
+            if (paused)
+            {
+                return;
+            }
+            if (!showUsage)
+            {
+                // 面板关着：缓存提醒开着就放慢到 15 秒一次继续跟踪（只读会话记录末尾新增的部分）；提醒也关了就完全不读
+                if (!alertsOn || DateTime.UtcNow - lastBgUsageUtc < TimeSpan.FromSeconds(Cad().BgPollSec))
+                {
+                    return;
+                }
+                lastBgUsageUtc = DateTime.UtcNow;
+            }
+            if (Interlocked.CompareExchange(ref usageBusy, 1, 0) != 0)
             {
                 return;
             }
@@ -6476,8 +8546,8 @@ namespace Stilla
         }
 
         // 窗口大小：默认随内容；用户拖动边缘调整后记住（基础单位）。最小尺寸保证内容放得下
-        private int MinW() { return showUsage ? 420 : 240; }
-        private int MinH() { return showUsage ? CompactH() + 196 : CompactH(); }
+        private int MinW() { return showUsage ? 520 : 240; }
+        private int MinH() { return showUsage ? CompactH() + 240 : CompactH(); }       // 240 = header and cups 146 + two rows + total, forecast and cost line + bottom margin
         private int CurW() { return Math.Max(MinW(), winWu > 0 ? winWu : ContentW()); }
         private int CurH() { return Math.Max(MinH(), winHu > 0 ? winHu : ContentH()); }
 
@@ -6550,6 +8620,12 @@ namespace Stilla
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (rowDrag)
+            {
+                rowDrag = false;
+                Capture = false;
+                SaveSettings();
+            }
             if (colDrag >= 0)
             {
                 colDrag = -1;
@@ -6571,6 +8647,9 @@ namespace Stilla
             tm.Items.Add("显示 / 隐藏", null, delegate { ToggleVisible(); });
             tm.Items.Add("黑白切换", null, delegate { ToggleInvert(); });
             tm.Items.Add("立即刷新", null, delegate { StartFetch(); });
+            ToolStripMenuItem trayPause = BuildPauseItem();
+            tm.Opening += delegate { trayPause.Checked = paused; };
+            tm.Items.Add(trayPause);
             tm.Items.Add("设置…", null, delegate { OpenSettings(); });
             tm.Items.Add(new ToolStripSeparator());
             tm.Items.Add("退出", null, delegate { exitRequested = true; Close(); });
@@ -6581,6 +8660,7 @@ namespace Stilla
             tray.DoubleClick += delegate { ToggleVisible(); };
             UpdateTrayText();
             tray.Visible = true;
+            InitExtras();
         }
 
         private void ToggleVisible()
@@ -6607,6 +8687,11 @@ namespace Stilla
             string week = data != null && data.SevenDay != null ? Math.Round(data.SevenDay.Percent).ToString("0", CultureInfo.InvariantCulture) + "%" : "—";
             Account acct = AccountStore.Current;
             string text = "Stilla " + (acct != null ? acct.Id + "·" + PlanInfo.ShortOf(acct.Plan) + " · " : "") + "5小时 " + five + " · 每周 " + week;
+            string counts = CountText();
+            if (counts.Length > 0)
+            {
+                text += " · " + counts;
+            }
             if (UpdateState.Available)
             {
                 text = "● " + text;
@@ -6622,18 +8707,6 @@ namespace Stilla
                 return null;
             }
             foreach (KeyValuePair<RectangleF, string> h in sessionHits)
-            {
-                if (h.Key.Contains(p))
-                {
-                    return h.Value;
-                }
-            }
-            return null;
-        }
-
-        private string ChevronAt(Point p)
-        {
-            foreach (KeyValuePair<RectangleF, string> h in chevHits)
             {
                 if (h.Key.Contains(p))
                 {
@@ -6678,13 +8751,13 @@ namespace Stilla
         // 鼠标在哪条列分隔线上（只在卡片的列区域里有效），没有就返回 -1
         private int DividerAt(Point p)
         {
-            if (!showUsage || usageMode == 4 || p.Y < colTop || p.Y > colBottom)
+            if (!showUsage || usageMode >= 3 || p.Y < colTop || p.Y > colBottom)
             {
                 return -1;
             }
-            for (int i = usageMode == 0 ? 0 : 1; i < 5; i++)
+            for (int i = FirstEdge(); i < 7; i++)
             {
-                if (Math.Abs(p.X - colEdgeX[i]) <= Math.Max(4f, 4f * scale))
+                if (colOn[i] && colNext[i] >= 0 && Math.Abs(p.X - colEdgeX[i]) <= Math.Max(4f, 4f * scale))
                 {
                     return i;
                 }
@@ -6696,24 +8769,25 @@ namespace Stilla
         private void DoColumnDrag(int x)
         {
             int i = colDrag;
-            double total = colDragStart[i] + colDragStart[i + 1];
+            int j = colNext[i] >= 0 ? colNext[i] : i + 1;
+            double total = colDragStart[i] + colDragStart[j];
             double a = colDragStart[i] + (x - colDragX0) / (double)colInner;
             if (a < MinColFrac(i))
             {
                 a = MinColFrac(i);
             }
-            if (total - a < MinColFrac(i + 1))
+            if (total - a < MinColFrac(j))
             {
-                a = total - MinColFrac(i + 1);
+                a = total - MinColFrac(j);
             }
             colFr[i] = a;
-            colFr[i + 1] = total - a;
+            colFr[j] = total - a;
             Redraw();
         }
 
         private double MinColFrac(int col)
         {
-            float px = col == 0 ? 120f * scale : col == 1 ? 56f * scale : 44f * scale;
+            float px = col == 0 ? 120f * scale : col == 1 ? 64f * scale : col == 2 ? 70f * scale : col == 3 && usageMode == 0 ? 78f * scale : col == 7 && usageMode != 0 ? 56f * scale : 52f * scale;
             return colInner > 0 ? px / colInner : 0;
         }
 
@@ -6887,7 +8961,10 @@ namespace Stilla
                 rowsExpanded = false;
                 rowScroll = 0;
                 autoWinHu = 0;
-                usageSnap = new UsageTracker.Snapshot();
+                if (!alertsOn)
+                {
+                    usageSnap = new UsageTracker.Snapshot();
+                }
             }
             ApplyScale();
             KeepOnScreen();
@@ -6948,17 +9025,29 @@ namespace Stilla
             logItem.Click += delegate { logger.Enabled = logItem.Checked; SaveSettings(); };
             menu.Items.Add(logItem);
 
+            ToolStripMenuItem alertItem = new ToolStripMenuItem("缓存快过期时系统提醒（面板关着也会每 15 秒读一次会话记录）");
+            alertItem.CheckOnClick = true;
+            alertItem.Checked = alertsOn;
+            alertItem.Click += delegate
+            {
+                alertsOn = alertItem.Checked;
+                if (!alertsOn && !showUsage)
+                {
+                    usageSnap = new UsageTracker.Snapshot();
+                    indicatorKey = -1;
+                    UpdateCacheIndicators();
+                }
+                SaveSettings();
+            };
+            menu.Items.Add(alertItem);
+
             ToolStripMenuItem usageItem = usageMenuItem = new ToolStripMenuItem("显示用量统计");
             usageItem.CheckOnClick = true;
             usageItem.Checked = showUsage;
             usageItem.Click += delegate { SetUsageVisible(usageItem.Checked); };
             menu.Items.Add(usageItem);
             menu.Items.Add("时间标签设置…", null, delegate { OpenTabSettings(); });
-            ToolStripMenuItem dsItem = new ToolStripMenuItem("显示 DeepSeek 估价行");
-            dsItem.CheckOnClick = true;
-            dsItem.Checked = showDeepSeek;
-            dsItem.Click += delegate { showDeepSeek = dsItem.Checked; SaveSettings(); Redraw(); };
-            menu.Items.Add(dsItem);
+            AddFeatureMenu(menu);
             menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem acctMenu = new ToolStripMenuItem("账号与订阅");
@@ -7270,6 +9359,10 @@ namespace Stilla
             return AppPaths.SettingsFile;
         }
 
+        private const int SettingsVersion = 2;      // settings.txt 的版本：0.2 起写入 sv=2；没有 sv 的是 0.1.x 的文件
+        private bool sawSv;
+        private bool legacyDs, sawDmask;             // 0.1.x 的 ds=1（打开了 DeepSeek 估价行）要带到新的「其他显示内容」开关里
+
         private void LoadSettings()
         {
             try
@@ -7293,15 +9386,27 @@ namespace Stilla
                     else if (k == "fg" && v >= FgMin && v <= 100) fgPercent = v;
                     else if (k == "top") TopMost = v != 0;
                     else if (k == "usage") showUsage = v != 0;
-                    else if (k == "w" && v > 0) winWu = v;
-                    else if (k == "h2" && v > 0) winHu = v;     // v16 起布局变了，旧版本保存的 h 不再使用（否则表格会被挤成一行）
+                    else if (k == "sv") sawSv = true;
+                    else if (k == "w" && v > 0 && v <= 10000) winWu = v;
+                    else if (k == "h2" && v > 0 && v <= 10000) winHu = v;     // v16 起布局变了，旧版本保存的 h 不再使用（否则表格会被挤成一行）
                     else if (k == "log") logger.Enabled = v != 0;
                     else if (k == "src" && v >= 0 && v <= 2) QuotaSource.Mode = v;
                     else if (k == "onl" && v >= 0 && v <= 2) QuotaSource.OnlineConsent = v;
-                    else if (k == "ds") showDeepSeek = v != 0;
                     else if (k == "upd") UpdateState.Auto = v != 0;
+                    else if (k == "alert") alertsOn = v != 0;
                     else if (k == "tabs" && v > 0 && v < (1 << TabCount)) tabMask = v;
-                    else if (k == "mode" && v >= 0 && v <= 4) usageMode = v;
+                    else if (k == "mode" && v >= 0 && v <= 5) legacyMode = v;       // 旧版本的视图编号（0 会话 1 模型 2 对比 3 档位 4 订阅 5 API）
+                    else if (k == "view" && v >= 0 && v <= 5)
+                    {
+                        usageMode = v;
+                        sawView = true;
+                    }
+                    else if (k == "speedwin" && v >= 1 && v <= 2880) speedMin = v;
+                    else if (k.Length == 5 && k.StartsWith("sort") && k[4] >= '0' && k[4] <= '2' && v >= 0 && v / 2 - 1 <= 7)
+                    {
+                        sortCol[k[4] - '0'] = v / 2 - 1;
+                        sortDesc[k[4] - '0'] = v % 2 == 1;
+                    }
                     else if (k == "skin" && v >= 0 && v < Skins.Length)
                     {
                         skinIndex = v;
@@ -7314,18 +9419,52 @@ namespace Stilla
                         ApplyPalette(skin, inverted);
                     }
                     else if (k == "modelview") usageMode = v != 0 ? 1 : 0;     // 旧版本的设置：只有会话和模型两种
+                    else if (k == "fmask") { fmask = v; sawFmask = true; }
+                    else if (k == "vmask") vmask = v;
+                    else if (k == "smask") smask = v;
+                    else if (k == "dmask") { dmask = v; sawDmask = true; }
+                    else if (k == "ds") legacyDs = v != 0;
+                    else if (k == "costscope" && (v == 0 || v == 1)) costScope = v;
+                    else if (k == "trendr" && (v == 0 || v == 1)) trendRange = v;
+                    else if (k == "tips" && (v == 0 || v == 1)) tipsOn = v == 1;
+                    else if (k == "rowh" && v >= RowHuMin && v <= RowHuMax) rowHu = v;
+                    else if (k == "colv") sawColv = true;
+                    else if (k == "alertmin" && v >= 1 && v <= 120) alertMin = v;
+                    else if (k == "limitwarn" && v >= 0 && v <= 100) limitWarn = v;
+                    else if (k == "tabpreset" && v > 0 && v < (1 << TabCount)) tabPreset = v;
+                    else if (k.Length == 4 && (k.StartsWith("crf") || k.StartsWith("crt")) && k[3] >= '0' && k[3] <= '4')
+                    {
+                        if (k[2] == 'f') crFrom[k[3] - '0'] = v; else crTo[k[3] - '0'] = v;
+                    }
                     else if (k == "cfrom") customFromMin = v;
                     else if (k == "cto") customToMin = v;
-                    else if (k.Length == 2 && k[0] == 'c' && k[1] >= '0' && k[1] <= '5' && v > 0) colFr[k[1] - '0'] = v / 1000.0;
+                    else if (k.Length == 3 && k[0] == 'c' && k[1] == 'c' && k[2] >= '0' && k[2] <= '7' && v > 0) colFr[k[2] - '0'] = v / 1000.0;
+                }
+                if (legacyDs && !sawDmask)
+                {
+                    dmask |= Feat.DsLine;       // 0.1.x 里专门打开过「显示 DeepSeek 估价行」：升级后保持打开（档位会显示成「自定义」）
+                }
+                if (!sawSv)
+                {
+                    // 0.1.x 保存的窗口大小是给旧版面板（420 宽）定的；0.2 的面板更宽，沿用旧尺寸会把新增的列挤没，所以只在升级后的第一次启动恢复默认大小
+                    winWu = 0;
+                    winHu = 0;
+                }
+                if (!sawView && legacyMode >= 0)
+                {
+                    int[] map = { 0, 1, 2, 2, 3, 4 };       // 旧的「档位」并进了「对比」，订阅 / API 的编号往前挪了一位
+                    usageMode = map[legacyMode];
                 }
             }
             catch (Exception)
             {
             }
+            FinishSettingsLoad();
         }
 
         private void SaveSettings()
         {
+            SyncMasksFromFields();
             try
             {
                 string path = SettingsPath();
@@ -7337,24 +9476,46 @@ namespace Stilla
                     "bg=" + bgPercent,
                     "fg=" + fgPercent,
                     "top=" + (TopMost ? 1 : 0),
+                    "sv=" + SettingsVersion,
                     "usage=" + (showUsage ? 1 : 0),
                     "w=" + winWu,
                     "h2=" + (rowsExpanded && autoWinHu > 0 && winHu == autoWinHu ? savedWinHu : winHu),
                     "log=" + (logger.Enabled ? 1 : 0),
                     "src=" + QuotaSource.Mode,
                     "onl=" + QuotaSource.OnlineConsent,
-                    "ds=" + (showDeepSeek ? 1 : 0),
                     "upd=" + (UpdateState.Auto ? 1 : 0),
-                    "mode=" + usageMode,
+                    "alert=" + (alertsOn ? 1 : 0),
+                    "view=" + usageMode,
+                    "speedwin=" + speedMin,
+                    "sort0=" + (sortCol[0] < 0 ? 0 : (sortCol[0] + 1) * 2 + (sortDesc[0] ? 1 : 0)),
+                    "sort1=" + (sortCol[1] < 0 ? 0 : (sortCol[1] + 1) * 2 + (sortDesc[1] ? 1 : 0)),
+                    "sort2=" + (sortCol[2] < 0 ? 0 : (sortCol[2] + 1) * 2 + (sortDesc[2] ? 1 : 0)),
                     "dark=" + (inverted ? 1 : 0),
                     "skin=" + skinIndex,
                     "tabs=" + tabMask,
-                    "c0=" + (int)Math.Round(colFr[0] * 1000),
-                    "c1=" + (int)Math.Round(colFr[1] * 1000),
-                    "c2=" + (int)Math.Round(colFr[2] * 1000),
-                    "c3=" + (int)Math.Round(colFr[3] * 1000),
-                    "c4=" + (int)Math.Round(colFr[4] * 1000),
-                    "c5=" + (int)Math.Round(colFr[5] * 1000),
+                    "cc0=" + (int)Math.Round(colFr[0] * 1000),
+                    "cc1=" + (int)Math.Round(colFr[1] * 1000),
+                    "cc2=" + (int)Math.Round(colFr[2] * 1000),
+                    "cc3=" + (int)Math.Round(colFr[3] * 1000),
+                    "cc4=" + (int)Math.Round(colFr[4] * 1000),
+                    "cc5=" + (int)Math.Round(colFr[5] * 1000),
+                    "cc6=" + (int)Math.Round(colFr[6] * 1000),
+                    "cc7=" + (int)Math.Round(colFr[7] * 1000),
+                    "profile=" + profile,
+                    "fmask=" + fmask,
+                    "vmask=" + vmask,
+                    "smask=" + smask,
+                    "dmask=" + dmask,
+                    "costscope=" + costScope,
+                    "trendr=" + trendRange,
+                    "tips=" + (tipsOn ? 1 : 0),
+                    "rowh=" + rowHu,
+                    "colv=2",
+                    "alertmin=" + alertMin,
+                    "limitwarn=" + limitWarn,
+                    "tabpreset=" + tabPreset,
+                    "crf0=" + crFrom[0], "crf1=" + crFrom[1], "crf2=" + crFrom[2], "crf3=" + crFrom[3], "crf4=" + crFrom[4],
+                    "crt0=" + crTo[0], "crt1=" + crTo[1], "crt2=" + crTo[2], "crt3=" + crTo[3], "crt4=" + crTo[4],
                     "cfrom=" + customFromMin,
                     "cto=" + customToMin
                 });
@@ -7630,6 +9791,22 @@ namespace Stilla
 
                 EnableDpiAwareness();
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+                // 界面线程里没被接住的异常（定时器 / 绘制里出了意外）：不弹 .NET 的「未处理的异常」对话框（定时器每 3 秒会再触发一次），吞掉，下一个 tick 重画 / 重试。
+                // 排查问题时设环境变量 STILLA_DEBUG=1，原因写进数据文件夹里的 error.log
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs ev)
+                {
+                    if (Environment.GetEnvironmentVariable("STILLA_DEBUG") == "1")
+                    {
+                        try
+                        {
+                            File.AppendAllText(Path.Combine(AppPaths.Home, "error.log"), DateTime.Now.ToString("s") + " " + ev.Exception + "\r\n");
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+                };
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new Widget());

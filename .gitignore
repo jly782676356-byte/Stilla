@@ -15,6 +15,7 @@ demo/
 settings.txt
 rate_limits.json
 roots.txt
+mail.txt
 statusline-chain-*.txt
 *.csv
 *.stilla-backup-*
@@ -29,3 +30,4 @@ __pycache__/
 *.user
 Thumbs.db
 desktop.ini
+error.log

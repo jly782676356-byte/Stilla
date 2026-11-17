@@ -57,7 +57,7 @@ namespace Stilla
             float pad = 14f * s;
             SkinDraw.Text(g, "Stilla · Quota", f.Small, p.Dim, new RectangleF(pad, 6f * s, 160f * s, 20f * s), StringAlignment.Near);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
             float tw = (w - 2f * pad - 8f * s) / 2f;
             float th = 136f * s, ty = 30f * s;
             DrawTile(g, new RectangleF(pad, ty, tw, th), "5 h", d.P5, d.Has5, d.Clock5, d.Left5, f, p, s);
@@ -345,7 +345,7 @@ namespace Stilla
             float pad = 14f * s;
             float inner = w - 2f * pad;
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
             // Two cropped big numbers: the top is cut off and the two numbers overlap each other
             GraphicsState st = g.Save();
             g.SetClip(new RectangleF(pad, 0f, inner, 90f * s));
@@ -365,9 +365,15 @@ namespace Stilla
             {
                 g.DrawLine(line, pad, 190f * s, w - pad, 190f * s);
             }
-            float legend = g.MeasureString("(R) Refresh  (X) Close", f.Small).Width;
+            string legendText = "(R) Refresh  (X) Close";
+            float legend = g.MeasureString(legendText, f.Small).Width;
+            if (g.MeasureString(d.Foot, f.Small).Width + legend + 4f * s > inner)
+            {
+                legendText = "(R) Refresh";
+                legend = g.MeasureString(legendText, f.Small).Width;
+            }
             SkinDraw.Text(g, d.Foot, f.Small, d.FootColor, new RectangleF(pad, 198f * s, Math.Max(40f * s, inner - legend - 4f * s), 16f * s), StringAlignment.Near);
-            SkinDraw.Text(g, "(R) Refresh  (X) Close", f.Small, p.Dim, new RectangleF(pad, 198f * s, inner, 16f * s), StringAlignment.Far);
+            SkinDraw.Text(g, legendText, f.Small, p.Dim, new RectangleF(pad, 198f * s, inner, 16f * s), StringAlignment.Far);
         }
 
         private static void Col(Graphics g, double pct, bool has, string label, string clock, string left, RectangleF r, Fonts f, SkinPalette p, float s)
@@ -569,6 +575,7 @@ namespace Stilla
         }
 
         public override string Name { get { return "2-E Line Geometry"; } }
+        public override float ShareWidth { get { return 44f; } }        // the share line + dot is 40 + 4 long: the default 11 let it run into the row name
         public override int CompactH { get { return 280; } }
         public override string DisplayFamily { get { return "Segoe UI"; } }
         public override FontStyle DisplayStyle { get { return FontStyle.Bold; } }
@@ -598,7 +605,7 @@ namespace Stilla
             float inner = w - 2f * pad;
             SkinDraw.Text(g, "Stilla Quota", f.Label, p.Main, new RectangleF(pad, 6f * s, 160f * s, 22f * s), StringAlignment.Near);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
 
             RectangleF box = new RectangleF(pad, 34f * s, inner, 150f * s);
             SkinDraw.Rr(g, p.Track, box, 7f * s);
@@ -744,7 +751,7 @@ namespace Stilla
             SkinDraw.Rr(g, p.Surface, new RectangleF(pad, 6f * s, inner, 26f * s), 0f);
             SkinDraw.Text(g, "STILLA", f.Display, p.Main, new RectangleF(pad + 8f * s, 6f * s, 120f * s, 26f * s), StringAlignment.Near);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
             SkinDraw.Text(g, d.Alert ? d.Foot : "QUOTA · updated " + d.Updated, f.Small, d.Alert ? d.FootColor : p.Dim, new RectangleF(pad, 40f * s, inner, 16f * s), StringAlignment.Near);
             using (Font title = SkinDraw.F("Segoe UI Black", 34f * s, FontStyle.Italic))
             {
@@ -753,7 +760,7 @@ namespace Stilla
             Item(g, "5-hour quota", d.P5, d.Has5, d.Clock5, d.Left5, 100f * s, pad, inner, f, p, s);
             Item(g, "Weekly quota", d.PW, d.HasW, d.ClockW, d.LeftW, 186f * s, pad, inner, f, p, s);
             SkinDraw.Rr(g, p.Surface, new RectangleF(pad, 258f * s, inner, 26f * s), 0f);
-            SkinDraw.Text(g, d.Source + " · no tokens", f.Small, p.Dim, new RectangleF(pad + 8f * s, 258f * s, inner * 0.6f, 26f * s), StringAlignment.Near);
+            SkinDraw.Text(g, d.Source + " · no tokens", f.Small, p.Dim, new RectangleF(pad + 8f * s, 258f * s, inner * 0.72f, 26f * s), StringAlignment.Near);
             SkinDraw.Text(g, "Stats →", f.Small, p.Main, new RectangleF(pad, 258f * s, inner - 8f * s, 26f * s), StringAlignment.Far);
         }
 
@@ -894,7 +901,7 @@ namespace Stilla
             RectangleF btnBack = RectangleF.Union(refresh, close);
             btnBack.Inflate(2f * s, 0f);
             SkinDraw.Rr(g, p.Surface, btnBack, 0f);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
             Item(g, "5-hour quota", d.P5, d.Has5, d.Clock5, d.Left5, "I", 70f * s, pad, inner, p, s);
             Item(g, "Weekly quota", d.PW, d.HasW, d.ClockW, d.LeftW, "II", 150f * s, pad, inner, p, s);
@@ -969,7 +976,11 @@ namespace Stilla
 
         public override void DrawFrame(Graphics g, RectangleF rect, SkinPalette p, float s)
         {
-            Card(g, p, rect, s);
+            // the usage table's last text row (cost / health line) must sit above the inner border: the bottom insets are smaller here than on the compact card (4 and 9 instead of 6 and 15)
+            RectangleF outer = new RectangleF(rect.X + 6f * s, rect.Y + 6f * s, rect.Width - 12f * s, rect.Height - 10f * s);
+            SkinDraw.Rr(g, p.Surface, outer, 0f);
+            SkinDraw.RrLine(g, p.Border, outer, 0f, 1f * s);
+            SkinDraw.RrLine(g, p.Border, new RectangleF(rect.X + 15f * s, rect.Y + 15f * s, rect.Width - 30f * s, rect.Height - 24f * s), 0f, 1f * s);
         }
 
         public override void DrawTitle(Graphics g, float x, float y, string text, Fonts f, SkinPalette p, float s)
@@ -1050,7 +1061,7 @@ namespace Stilla
                 SkinDraw.Text(g, "quota", logo, p.Main, new RectangleF(pad + 4f * s, 14f * s, 120f * s, 26f * s), StringAlignment.Near);
             }
             SkinDraw.Rr(g, p.Track, refresh, refresh.Height / 2f);
-            SkinDraw.Text(g, "Reload", f.Small, p.Main, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Main, refresh, StringAlignment.Center);
             SkinDraw.Rr(g, p.Main, close, close.Height / 2f);
             SkinDraw.Text(g, "×", f.Label, p.Bg, close, StringAlignment.Center);
 
@@ -1169,7 +1180,7 @@ namespace Stilla
             InkPainter.DrawLogo(g, pad + 4f * s, 14f * s, s, p.Main);
             SkinDraw.Text(g, "STILLA", f.Display, p.Main, new RectangleF(pad + 30f * s, 10f * s, 120f * s, 22f * s), StringAlignment.Near);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
             using (Font blobFont = SkinDraw.F("Segoe UI Black", 24f * s, FontStyle.Italic))
             {
                 SkinDraw.Blobs(g, new RectangleF(pad, 40f * s, inner, 96f * s), d.P5, d.PW, 40f * s, p.Main, p.Surface, s, blobFont,
@@ -1279,7 +1290,7 @@ namespace Stilla
             SkinDraw.RrLine(g, p.Border, new RectangleF(6f * s, 6f * s, w - 12f * s, CompactH * s - 12f * s), 0f, 1f * s);
             SkinDraw.Text(g, "+", f.Display, p.Main, new RectangleF(w / 2f - 20f * s, 4f * s, 40f * s, 30f * s), StringAlignment.Center);
             SkinDraw.Text(g, "×", f.Label, p.Dim, close, StringAlignment.Center);
-            SkinDraw.Text(g, "Reload", f.Small, p.Dim, refresh, StringAlignment.Center);
+            SkinDraw.Text(g, "Refresh", f.Small, p.Dim, refresh, StringAlignment.Center);
 
             Tile(g, new RectangleF(pad, 46f * s, 120f * s, 92f * s), 0, "5H · 5 hours", d.Has5 ? Num(d.P5) + "%" : "—", f, s);
             Tile(g, new RectangleF(w - pad - 102f * s, 74f * s, 102f * s, 130f * s), 1, "7D · Weekly", d.HasW ? Num(d.PW) + "%" : "—", f, s);

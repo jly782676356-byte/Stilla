@@ -569,6 +569,7 @@ namespace Stilla
         }
 
         public override string Name { get { return "2-E 线稿几何"; } }
+        public override float ShareWidth { get { return 44f; } }        // the share line + dot is 40 + 4 long: the default 11 let it run into the row name
         public override int CompactH { get { return 280; } }
         public override string DisplayFamily { get { return "Segoe UI"; } }
         public override FontStyle DisplayStyle { get { return FontStyle.Bold; } }
@@ -969,7 +970,11 @@ namespace Stilla
 
         public override void DrawFrame(Graphics g, RectangleF rect, SkinPalette p, float s)
         {
-            Card(g, p, rect, s);
+            // the usage table's last text row (cost / health line) must sit above the inner border: the bottom insets are smaller here than on the compact card (4 and 9 instead of 6 and 15)
+            RectangleF outer = new RectangleF(rect.X + 6f * s, rect.Y + 6f * s, rect.Width - 12f * s, rect.Height - 10f * s);
+            SkinDraw.Rr(g, p.Surface, outer, 0f);
+            SkinDraw.RrLine(g, p.Border, outer, 0f, 1f * s);
+            SkinDraw.RrLine(g, p.Border, new RectangleF(rect.X + 15f * s, rect.Y + 15f * s, rect.Width - 30f * s, rect.Height - 24f * s), 0f, 1f * s);
         }
 
         public override void DrawTitle(Graphics g, float x, float y, string text, Fonts f, SkinPalette p, float s)

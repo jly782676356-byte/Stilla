@@ -78,7 +78,7 @@ namespace Stilla
                 req.Method = "GET";
                 req.Timeout = 15000;
                 req.ReadWriteTimeout = 15000;
-                req.UserAgent = "Stilla/0.1";
+                req.UserAgent = "Stilla/" + AppInfo.Version;
                 req.Accept = "application/json";
                 req.Headers["Authorization"] = "Bearer " + token;
                 req.Headers["anthropic-beta"] = "oauth-2025-04-20";
@@ -312,6 +312,136 @@ namespace Stilla
         }
     }
 
+    // Each session's current state: the status that Claude Code itself writes into ~/.claude/sessions/<pid>.json:
+    //   busy = running (model thinking / outputting / running a tool), idle = idle (this turn is done), waiting = waiting for you (waitingFor says what for:
+    //   dialog open = a permission / plan-approval dialog, input needed = a question, sandbox request = a sandbox request, ...).
+    // Files whose process is gone are ignored (a file may be left behind after a crash). Re-read every 2 seconds, read-only
+    internal static class SessionStatus
+    {
+        public sealed class Info
+        {
+            public string Status = "";
+            public string WaitingFor = "";
+            public int Pid;                 // Claude Code process
+            public string Cwd = "";         // Folder the session runs in
+            public string Entrypoint = "";  // claude-vscode = opened in the VS Code extension; cli = opened in a terminal
+        }
+
+        private static readonly object gate = new object();
+        private static Dictionary<string, Info> map = new Dictionary<string, Info>();
+        private static DateTime loadedUtc = DateTime.MinValue;
+
+        public static Info Get(string sessionId)
+        {
+            Refresh();
+            lock (gate)
+            {
+                Info i;
+                return sessionId != null && map.TryGetValue(sessionId, out i) ? i : null;
+            }
+        }
+
+        private static bool Alive(int pid, DateTime fileWriteUtc)
+        {
+            try
+            {
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(pid))
+                {
+                    if (p.HasExited)
+                    {
+                        return false;
+                    }
+                    try
+                    {
+                        // Process IDs get reused by the system: a process that started after the file was last written is not the Claude Code that wrote this file (a file left behind after a crash)
+                        return p.StartTime.ToUniversalTime() <= fileWriteUtc.AddMinutes(1);
+                    }
+                    catch (Exception)
+                    {
+                        return true;        // The start time cannot be read (not enough permission): count it as alive
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static void Refresh()
+        {
+            lock (gate)
+            {
+                if (DateTime.UtcNow - loadedUtc < TimeSpan.FromSeconds(2))
+                {
+                    return;
+                }
+                loadedUtc = DateTime.UtcNow;
+            }
+            Dictionary<string, Info> fresh = new Dictionary<string, Info>();
+            try
+            {
+                foreach (string dir in ClaudeRoots.SessionDirs())
+                {
+                    JavaScriptSerializer js = new JavaScriptSerializer();
+                    foreach (string path in Directory.GetFiles(dir, "*.json"))
+                    {
+                        try
+                        {
+                            string text;
+                            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                            {
+                                text = sr.ReadToEnd();
+                            }
+                            Dictionary<string, object> o = js.DeserializeObject(text) as Dictionary<string, object>;
+                            object sid, st, wf, pid;
+                            if (o == null || !o.TryGetValue("sessionId", out sid) || !(sid is string) || !o.TryGetValue("status", out st) || !(st is string))
+                            {
+                                continue;
+                            }
+                            if (o.TryGetValue("pid", out pid) && pid != null && !Alive(Convert.ToInt32(pid, CultureInfo.InvariantCulture), File.GetLastWriteTimeUtc(path)))
+                            {
+                                continue;
+                            }
+                            Info info = new Info();
+                            info.Status = (string)st;
+                            if (o.TryGetValue("waitingFor", out wf) && wf is string)
+                            {
+                                info.WaitingFor = (string)wf;
+                            }
+                            object cwdO, epO;
+                            if (o.TryGetValue("cwd", out cwdO) && cwdO is string)
+                            {
+                                info.Cwd = (string)cwdO;
+                            }
+                            if (o.TryGetValue("entrypoint", out epO) && epO is string)
+                            {
+                                info.Entrypoint = (string)epO;
+                            }
+                            if (pid != null)
+                            {
+                                info.Pid = Convert.ToInt32(pid, CultureInfo.InvariantCulture);
+                            }
+                            fresh[(string)sid] = info;
+                        }
+                        catch (Exception)
+                        {
+                            // This file is being written or has an unknown format: skip it
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            lock (gate)
+            {
+                map = fresh;
+            }
+        }
+    }
+
     // Claude Code session names (same as shown in the app): the name in ~/.claude/sessions/<pid>.json.
     // nameSource = user is a name you changed, derived is an automatically generated name. Re-read every 30 seconds.
     internal static class SessionNames
@@ -433,6 +563,7 @@ namespace Stilla
             public string Model;
             public string Tier = "";                            // Tier: thinking effort low / medium / high / xhigh / max; with Ultracode on it is ultra; fast mode adds +fast; entries without a tag are "Unlabeled"
             public long Msgs;                                   // Number of API messages
+            public long Think;                                  // Of which thinking tokens
             public DateTime FirstUtc = DateTime.MaxValue;       // First and last time this session x model x tier appeared (UTC): used for ordering to see when it was switched midway
             public DateTime LastUtc = DateTime.MinValue;
             public long Total;
@@ -474,12 +605,26 @@ namespace Stilla
             AddTokens(tt.Tok, r.In, r.Out, r.CacheWrite - r.CacheWrite1h, r.CacheWrite1h, r.CacheRead);
         }
 
+        // A session's latest message (used to compute the burn speed): time, model, tier, token counts by type
+        public sealed class RecentUse
+        {
+            public DateTime Utc;
+            public string Model = "";
+            public string Tier = "";
+            public readonly long[] Tok = new long[10];
+        }
+
         // A session's current state (independent of time range): last activity, whether it is being written, when the cache expires. Used for table sorting
         public sealed class LiveInfo
         {
+            public readonly List<RecentUse> Recent = new List<RecentUse>();     // Every message of this session (including subagent tasks) in the last 3 hours
             public DateTime LastUtc;
             public bool Active;
+            public bool Waiting;                // Waiting for you (Claude Code status == waiting: a permission / question / plan-approval dialog)
             public DateTime? ExpiryUtc;
+            public long Ctx;                    // Context size of the main session's latest message (input + cache write + cache read)
+            public string Model = "";           // Model used by the main session's latest message
+            public int TtlMin;                  // Cache lifetime in minutes; 0 = unknown
         }
 
         // Totals per model x tier (used by the tier view). Tier = thinking effort (low / medium / high / xhigh / max); with Ultracode on it is ultra; fast mode appends +fast
@@ -498,6 +643,7 @@ namespace Stilla
         {
             public string Label = "";
             public string Range = "";
+            public DateTime From = DateTime.MinValue, To = DateTime.MaxValue;    // Start and end of this time range (UTC); the popup reads the log by it
             public long Total;
             public long Input, Output, CacheWrite, CacheRead;
             public readonly List<SessionTotal> Rows = new List<SessionTotal>();
@@ -854,6 +1000,7 @@ namespace Stilla
             Dictionary<string, string> cwdBy = new Dictionary<string, string>();
             Dictionary<string, string> titleBy = new Dictionary<string, string>();
             HashSet<string> active = new HashSet<string>();
+            HashSet<string> waiting = new HashSet<string>();
             foreach (FileState fs in files.Values)
             {
                 if (fs.Title != null && !fs.Sub)
@@ -868,6 +1015,19 @@ namespace Stilla
                 if (now - fs.Mtime < TimeSpan.FromSeconds(ActiveSeconds))
                 {
                     active.Add(fs.Session);
+                }
+                // Status reported by Claude Code itself: busy = running (including model thinking / tool execution, during which the log has no new records), waiting = waiting for you
+                SessionStatus.Info si = SessionStatus.Get(fs.Session);
+                if (si != null)
+                {
+                    if (si.Status == "busy")
+                    {
+                        active.Add(fs.Session);
+                    }
+                    else if (si.Status == "waiting")
+                    {
+                        waiting.Add(fs.Session);
+                    }
                 }
             }
 
@@ -902,10 +1062,10 @@ namespace Stilla
             shortP.Label = "15 min";
             shortP.Range = Clock(shortStart) + "–" + Clock(now);
             PeriodSummary cur = snap.Periods[1];
-            cur.Label = rolling ? "Last 5 h" : "This 5 h";
+            cur.Label = rolling ? "Last 5h" : "This 5h";
             cur.Range = Clock(curStart) + "–" + Clock(end);
             PeriodSummary prev = snap.Periods[2];
-            prev.Label = rolling ? "Prior 5 h" : "Prev 5 h";
+            prev.Label = rolling ? "Prior 5h" : "Prev 5h";
             prev.Range = Clock(prevStart) + "–" + Clock(curStart);
 
             FillPeriod(shortP, shortStart, DateTime.MaxValue, cwdBy, titleBy, active);
@@ -982,19 +1142,59 @@ namespace Stilla
 
             // Per session: last activity (any message, including subtasks), whether it is being written, cache expiry: used for panel sorting
             Dictionary<string, DateTime> lastBy = new Dictionary<string, DateTime>();
+            Dictionary<string, Rec> lastMain = new Dictionary<string, Rec>();
+            Dictionary<string, List<RecentUse>> recentBy = new Dictionary<string, List<RecentUse>>();
             foreach (Rec r in recs.Values)
             {
+                if (now - r.Utc <= TimeSpan.FromMinutes(180))
+                {
+                    List<RecentUse> rl;
+                    if (!recentBy.TryGetValue(r.Session, out rl))
+                    {
+                        rl = new List<RecentUse>();
+                        recentBy[r.Session] = rl;
+                    }
+                    RecentUse ru = new RecentUse();
+                    ru.Utc = r.Utc;
+                    ru.Model = r.Model;
+                    ru.Tier = TagStore.TierKey(TagStore.Get(r.Id) ?? TagStore.FromRec(r));
+                    AddTokens(ru.Tok, r.In, r.Out, r.CacheWrite - r.CacheWrite1h, r.CacheWrite1h, r.CacheRead);
+                    rl.Add(ru);
+                }
                 DateTime lastSeen;
                 if (!lastBy.TryGetValue(r.Session, out lastSeen) || r.Utc > lastSeen)
                 {
                     lastBy[r.Session] = r.Utc;
+                }
+                Rec lm;
+                if (r.Agent == null && (!lastMain.TryGetValue(r.Session, out lm) || r.Utc > lm.Utc))
+                {
+                    lastMain[r.Session] = r;
                 }
             }
             foreach (KeyValuePair<string, DateTime> kv in lastBy)
             {
                 LiveInfo liveInfo = new LiveInfo();
                 liveInfo.LastUtc = kv.Value;
-                liveInfo.Active = active.Contains(kv.Key);
+                liveInfo.Waiting = waiting.Contains(kv.Key);
+                liveInfo.Active = active.Contains(kv.Key) && !liveInfo.Waiting;
+                List<RecentUse> recentList;
+                if (recentBy.TryGetValue(kv.Key, out recentList))
+                {
+                    recentList.Sort(delegate(RecentUse a, RecentUse b) { return a.Utc.CompareTo(b.Utc); });
+                    liveInfo.Recent.AddRange(recentList);
+                }
+                Rec mainRec;
+                if (lastMain.TryGetValue(kv.Key, out mainRec))
+                {
+                    liveInfo.Ctx = mainRec.In + mainRec.CacheRead + mainRec.CacheWrite;
+                    liveInfo.Model = mainRec.Model;
+                }
+                int ttlMin;
+                if (ttlBy.TryGetValue(kv.Key, out ttlMin))
+                {
+                    liveInfo.TtlMin = ttlMin;
+                }
                 DateTime expUtc;
                 if (expiryBy.TryGetValue(kv.Key, out expUtc))
                 {
@@ -1021,6 +1221,8 @@ namespace Stilla
         // Summarize the records in the [from, to) time range, grouped by session
         private void FillPeriod(PeriodSummary p, DateTime from, DateTime to, Dictionary<string, string> cwdBy, Dictionary<string, string> titleBy, HashSet<string> active)
         {
+            p.From = from;
+            p.To = to;
             Dictionary<string, SessionTotal> map = new Dictionary<string, SessionTotal>();
             Dictionary<string, HashSet<string>> agents = new Dictionary<string, HashSet<string>>();
             Dictionary<string, ModelTotal> byModel = new Dictionary<string, ModelTotal>();
@@ -1032,7 +1234,8 @@ namespace Stilla
                     continue;
                 }
                 long all = r.In + r.Out + r.CacheWrite + r.CacheRead;
-                string tierK = TagStore.TierKey(TagStore.Get(r.Id) ?? TagStore.FromRec(r));
+                TagStore.Tag tg0 = TagStore.Get(r.Id) ?? TagStore.FromRec(r);
+                string tierK = TagStore.TierKey(tg0);
                 string mkey = r.Session + "\n" + r.Model + "\n" + tierK;
                 ModelTotal mt;
                 if (!byModel.TryGetValue(mkey, out mt))
@@ -1044,6 +1247,7 @@ namespace Stilla
                     byModel[mkey] = mt;
                 }
                 mt.Msgs++;
+                mt.Think += tg0.Think;
                 if (r.Utc < mt.FirstUtc)
                 {
                     mt.FirstUtc = r.Utc;
@@ -1380,6 +1584,7 @@ namespace Stilla
         private DateTime lastQuotaUtc = DateTime.MinValue;
 
         public bool Enabled = true;
+        public volatile bool Paused;        // While "pause background reading" is on, this round does not read the session records (for gaming); the next round after resuming catches up
 
         public string DetailPath
         {
@@ -1437,7 +1642,7 @@ namespace Stilla
 
         private void OnTimer(object state)
         {
-            if (!Enabled || Interlocked.CompareExchange(ref busy, 1, 0) != 0)
+            if (!Enabled || Paused || Interlocked.CompareExchange(ref busy, 1, 0) != 0)
             {
                 return;
             }
@@ -2373,6 +2578,7 @@ namespace Stilla
         public double ReadScale = 1;                           // Scale of the cache-read unit price (fitted; 1 = official price)
         public double CalibErr = -1;                           // "Ex-ante prediction" error of the quota conversion: each block of data is fitted on the data before it and then predicted; mean relative error; -1 = none
         public int CalibBlocks;                                // Number of blocks taken into account
+        public bool PlanDerived;                               // The current basis does not have enough data of its own to fit; the coefficients are inferred from another basis by the plan multiplier (can be off by several times; speed is marked with "≈")
         public bool Stale;                                     // The file has no result for the current account / plan yet: keep only the price table (used by the subscription view to convert amounts), never use coefficients (show "-"), and do not apply another account's coefficients
 
         // key = the current "basis" (account:plan, e.g. B:pro). quota_fit.py writes one group of rows per basis (last column), with the current basis written last;
@@ -2423,6 +2629,7 @@ namespace Stilla
                 }
                 if (f[0] == "Global")
                 {
+                    t.PlanDerived = f[11].StartsWith("Estimated from plan multiplier", StringComparison.Ordinal);
                     double scale, err;
                     int blocks;
                     if (f.Length > 16 && double.TryParse(f[16], NumberStyles.Float, CultureInfo.InvariantCulture, out scale) && scale > 0)
@@ -2454,7 +2661,7 @@ namespace Stilla
                 bool ok = true;
                 for (int i = 0; i < 5; i++)
                 {
-                    ok = ok && double.TryParse(f[2 + i], NumberStyles.Float, CultureInfo.InvariantCulture, out e.Price[i]);
+                    ok = ok && double.TryParse(f[2 + i], NumberStyles.Float, CultureInfo.InvariantCulture, out e.Price[i]) && !double.IsNaN(e.Price[i]) && !double.IsInfinity(e.Price[i]) && e.Price[i] >= 0;
                 }
                 if (!ok)
                 {
@@ -2462,6 +2669,14 @@ namespace Stilla
                 }
                 double.TryParse(f[7], NumberStyles.Float, CultureInfo.InvariantCulture, out e.K5);
                 double.TryParse(f[9], NumberStyles.Float, CultureInfo.InvariantCulture, out e.KW);
+                if (double.IsNaN(e.K5) || double.IsInfinity(e.K5) || e.K5 < 0)
+                {
+                    e.K5 = 0;
+                }
+                if (double.IsNaN(e.KW) || double.IsInfinity(e.KW) || e.KW < 0)
+                {
+                    e.KW = 0;
+                }
                 if (t.Stale)
                 {
                     e.K5 = 0;
@@ -2531,6 +2746,8 @@ namespace Stilla
             {
                 res[k] = new UsageTracker.PeriodSummary();
                 res[k].Label = labels[k];
+                res[k].From = froms[k].ToUniversalTime();
+                res[k].To = tos[k].Year >= 9999 ? DateTime.MaxValue : tos[k].ToUniversalTime();
                 res[k].Range = froms[k].ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) + " ~ " + tos[k].ToString("MM-dd HH:mm", CultureInfo.InvariantCulture);
                 sessions[k] = new Dictionary<string, UsageTracker.SessionTotal>();
                 models[k] = new Dictionary<string, UsageTracker.ModelTotal>();
@@ -2595,6 +2812,177 @@ namespace Stilla
             return res;
         }
 
+        public static string[] SplitCsv(string line)
+        {
+            return ParseCsv(line);
+        }
+
+        public static long ToLong(string s)
+        {
+            return Num(s);
+        }
+
+        // Switch records of one session in [fromUtc, toUtc): the main session's messages in time order, with consecutive runs of the same model + tier merged into one segment;
+        // subagent tasks (subagents / workflows) interleave with the main session's messages and are merged per model + tier into their own rows (Sub = true), placed last
+        public static List<SessionRun> ReadRuns(string detailPath, string session, DateTime fromUtc, DateTime toUtc)
+        {
+            List<SessionRun> result = new List<SessionRun>();
+            if (!File.Exists(detailPath) || string.IsNullOrEmpty(session))
+            {
+                return result;
+            }
+            TagStore.Refresh();
+            DateTime from = fromUtc.Year <= 1 ? DateTime.MinValue : fromUtc.ToLocalTime();
+            DateTime to = toUtc.Year >= 9999 ? DateTime.MaxValue : toUtc.ToLocalTime();
+            List<KeyValuePair<DateTime, string[]>> msgs = new List<KeyValuePair<DateTime, string[]>>();
+            using (FileStream fs = new FileStream(detailPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    if (line.IndexOf(session, StringComparison.Ordinal) < 0)
+                    {
+                        continue;
+                    }
+                    int comma = line.IndexOf(',');
+                    DateTime t;
+                    if (comma <= 0 || !DateTime.TryParseExact(line.Substring(0, comma), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    if (t < from || t >= to)
+                    {
+                        continue;
+                    }
+                    string[] f = ParseCsv(line);
+                    if (f.Length >= 11 && f[1] == session)
+                    {
+                        msgs.Add(new KeyValuePair<DateTime, string[]>(t, f));
+                    }
+                }
+            }
+            msgs.Sort(delegate(KeyValuePair<DateTime, string[]> a, KeyValuePair<DateTime, string[]> b) { return a.Key.CompareTo(b.Key); });
+            SessionRun cur = null;
+            Dictionary<string, SessionRun> subs = new Dictionary<string, SessionRun>();
+            foreach (KeyValuePair<DateTime, string[]> m in msgs)
+            {
+                string[] f = m.Value;
+                string model = f[3];
+                if (model.Length == 0 || model.StartsWith("<", StringComparison.Ordinal))
+                {
+                    continue;       // Placeholder messages such as <synthetic> that carry no usage
+                }
+                string tier = TagStore.TierKey(TagStore.Get(f[10]));
+                bool sub = f[9] == "1";
+                SessionRun r;
+                if (sub)
+                {
+                    string key = model + "\n" + tier;
+                    if (!subs.TryGetValue(key, out r))
+                    {
+                        r = new SessionRun();
+                        r.Model = model;
+                        r.Tier = tier;
+                        r.Sub = true;
+                        subs[key] = r;
+                    }
+                }
+                else
+                {
+                    if (cur == null || cur.Model != model || cur.Tier != tier)
+                    {
+                        cur = new SessionRun();
+                        cur.Model = model;
+                        cur.Tier = tier;
+                        result.Add(cur);
+                    }
+                    r = cur;
+                }
+                TagStore.Tag tag = TagStore.Get(f[10]);
+                long inp = Num(f[4]), outp = Num(f[5]), cw1 = Num(f[7]), cw5 = Num(f[6]), cr = Num(f[8]);
+                UsageTracker.AddTokens(r.Tok, inp, outp, cw5, cw1, cr);
+                r.Msgs++;
+                r.Think += tag == null ? 0 : tag.Think;
+                if (m.Key < r.First)
+                {
+                    r.First = m.Key;
+                }
+                if (m.Key > r.Last)
+                {
+                    r.Last = m.Key;
+                }
+            }
+            List<SessionRun> subList = new List<SessionRun>(subs.Values);
+            subList.Sort(delegate(SessionRun a, SessionRun b) { return a.First.CompareTo(b.First); });
+            result.AddRange(subList);
+            return result;
+        }
+
+        // All historical usage of non-Claude models called through an API (e.g. DeepSeek): totals per model, not split by time range
+        public sealed class ApiTotal
+        {
+            public string Model = "";
+            public long Msgs, In, Out, Cw, Cr;
+            public DateTime First = DateTime.MaxValue, Last = DateTime.MinValue;
+        }
+
+        public static List<ApiTotal> ReadApiTotals(string detailPath)
+        {
+            Dictionary<string, ApiTotal> map = new Dictionary<string, ApiTotal>();
+            if (!File.Exists(detailPath))
+            {
+                return new List<ApiTotal>();
+            }
+            using (FileStream fs = new FileStream(detailPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    int comma = line.IndexOf(',');
+                    DateTime t;
+                    if (comma <= 0 || !DateTime.TryParseExact(line.Substring(0, comma), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    string[] f = ParseCsv(line);
+                    if (f.Length < 11)
+                    {
+                        continue;
+                    }
+                    string model = System.Text.RegularExpressions.Regex.Replace(f[3] ?? "", @"-\d{8}$", "");
+                    if (model.Length == 0 || model.StartsWith("claude", StringComparison.OrdinalIgnoreCase) || model.StartsWith("<", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    ApiTotal a;
+                    if (!map.TryGetValue(model, out a))
+                    {
+                        a = new ApiTotal();
+                        a.Model = model;
+                        map[model] = a;
+                    }
+                    a.Msgs++;
+                    a.In += Num(f[4]);
+                    a.Out += Num(f[5]);
+                    a.Cw += Num(f[6]) + Num(f[7]);
+                    a.Cr += Num(f[8]);
+                    if (t < a.First)
+                    {
+                        a.First = t;
+                    }
+                    if (t > a.Last)
+                    {
+                        a.Last = t;
+                    }
+                }
+            }
+            List<ApiTotal> list = new List<ApiTotal>(map.Values);
+            list.Sort(delegate(ApiTotal a, ApiTotal b) { return b.Last.CompareTo(a.Last); });
+            return list;
+        }
+
         private static void Add(UsageTracker.PeriodSummary p, Dictionary<string, UsageTracker.SessionTotal> sessions,
             Dictionary<string, UsageTracker.ModelTotal> models, Dictionary<string, UsageTracker.TierTotal> tiers, TagStore.Tag tag,
             string[] f, long inp, long outp, long cw, long cr, Dictionary<string, string> indexTitles, DateTime when)
@@ -2634,6 +3022,7 @@ namespace Stilla
                 models[mkey] = mt;
             }
             mt.Msgs++;
+            mt.Think += tag == null ? 0 : tag.Think;
             if (whenUtc < mt.FirstUtc)
             {
                 mt.FirstUtc = whenUtc;
@@ -2799,6 +3188,7 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(360, 250);
 
             Label tip = new Label();
@@ -2869,7 +3259,8 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(360, 200);
+            DialogDpi.Apply(this);
+            ClientSize = new Size(430, 200);
 
             Label lf = new Label();
             lf.Text = "Start";
@@ -2891,8 +3282,8 @@ namespace Stilla
             {
                 Button b = new Button();
                 b.Text = presets[i];
-                b.Size = new Size(64, 26);
-                b.Location = new Point(16 + i * 68, 96);
+                b.Size = new Size(78, 26);
+                b.Location = new Point(16 + i * 80, 96);
                 int which = i;
                 b.Click += delegate { ApplyPreset(which); };
                 Controls.Add(b);
@@ -2901,7 +3292,7 @@ namespace Stilla
             Button ok = new Button();
             ok.Text = "OK";
             ok.Size = new Size(70, 28);
-            ok.Location = new Point(186, 150);
+            ok.Location = new Point(201, 150);
             ok.Click += delegate
             {
                 if (From >= To)
@@ -2914,7 +3305,7 @@ namespace Stilla
             Button cancel = new Button();
             cancel.Text = "Cancel";
             cancel.Size = new Size(70, 28);
-            cancel.Location = new Point(266, 150);
+            cancel.Location = new Point(281, 150);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; };
             Controls.Add(ok);
             Controls.Add(cancel);
@@ -2979,6 +3370,7 @@ namespace Stilla
             Text = "Session details - " + title;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(680, 440);
 
             list = new ListView();
@@ -2992,7 +3384,7 @@ namespace Stilla
             list.Columns.Add("Output", 70, HorizontalAlignment.Right);
             list.Columns.Add("Cache W", 80, HorizontalAlignment.Right);
             list.Columns.Add("Cache R", 90, HorizontalAlignment.Right);
-            list.Columns.Add("Subagent", 60, HorizontalAlignment.Center);
+            list.Columns.Add("Subagent", 72, HorizontalAlignment.Center);
 
             Panel bottom = new Panel();
             bottom.Dock = DockStyle.Bottom;
@@ -3012,7 +3404,7 @@ namespace Stilla
             bottom.Controls.Add(open);
             Button record = new Button();
             record.Text = "Open session record";
-            record.SetBounds(262, 7, 120, 28);
+            record.SetBounds(262, 7, 140, 28);
             record.Click += delegate { OpenTranscript(); };
             bottom.Controls.Add(record);
 
@@ -3185,7 +3577,7 @@ namespace Stilla
 
     // The widget itself. It composes its own picture with a "per-pixel-alpha layered window":
     // the background (rounded panel + border) and the foreground (text + progress bars) each have their own opacity and do not affect each other.
-    internal sealed class Widget : Form
+    internal sealed partial class Widget : Form
     {
         private const int BaseW = 264;
         private const int PollSeconds = 60;
@@ -3293,11 +3685,10 @@ namespace Stilla
         private const int ToggleBarH = 22;      // Height of the "simple / detailed" toggle bar between the compact card and the usage panel (base units, before scaling)
         private RectangleF toggleRect;          // Position of the toggle button (a click switches between simple and detailed mode)
         private ToolStripMenuItem usageMenuItem;   // The "Show usage statistics" item of the right-click menu; its check mark has to follow when the toggle bar changes the state
-        private bool showDeepSeek;              // The "DeepSeek off-peak price estimate" row at the bottom of the panel: hidden by default (a very personal feature, enable it with ds=1 or from the right-click menu)
         private UsageTracker usage;
         private UsageTracker.Snapshot usageSnap = new UsageTracker.Snapshot();
-        private const int UsageW = 420;         // Window width when usage statistics are open (the session table has to fit the cache-left time and four number columns)
-        private const int UsagePanelH = 288;    // Panel height (base size, before scaling): header and liquid cups 146 + 6 rows x 16 + totals and cost 36
+        private const int UsageW = 600;         // Window width when usage statistics are open (the session table has to fit cache left, speed, four number columns and cost)
+        private const int UsagePanelH = 304;    // Panel height (base size, before scaling): header and liquid cups 146 + 6 rows x 16 + total, cap forecast and cost 52
         private const int DiagramH = 130;       // Height of the ink-drop double circle (base size, before scaling)
         private bool rowsExpanded;              // "N more" was clicked: expand all sessions (the window grows as needed)
         private int rowScroll;                  // When the expanded window does not fit, which row the mouse wheel has scrolled to
@@ -3322,8 +3713,8 @@ namespace Stilla
         private UsageLogger logger;             // Usage log: the detail and quota snapshots are written into the "logs" folder
         private NotifyIcon tray;                // Tray icon: closing the window shrinks it to the tray; only "Exit" in the tray menu really ends the program
         private bool exitRequested;
-        private int usageMode;                  // Panel view: 0 = sessions, 1 = models, 2 = compare, 3 = tiers, 4 = subscription
-        private readonly RectangleF[] segRects = new RectangleF[5];   // Positions of the five view buttons in the header (session / model / compare / tier / subscription)
+        private int usageMode;                  // Panel view: 0 = Session, 1 = Model, 2 = Compare (model x tier), 3 = Plan, 4 = API
+        private readonly RectangleF[] segRects = new RectangleF[6];   // Positions of the six view buttons in the header (Session / Model / Compare / Plan / API / Trend); hidden ones are empty rectangles
         private QuotaTable quota;                                  // Quota conversion table (logs\quota_conversion.csv); null when there is no file
         private DateTime quotaReadUtc = DateTime.MinValue;
         private DateTime quotaFitUtc = DateTime.MinValue;          // The last time the quota conversion was recomputed in the background
@@ -3347,16 +3738,59 @@ namespace Stilla
             public long Reset;
         }
         private DateTime vsyncUtc = DateTime.MinValue;   // The last time the VS Code titles were exported
-        private readonly double[] colFr = { 0.31, 0.125, 0.115, 0.12, 0.165, 0.165 };   // Column width ratios: session name, cache left, input, output, cache write, cache read (sum is 1, can be dragged)
-        private readonly float[] colWidth = new float[6];   // Width of each column in this draw (physical pixels)
-        private readonly float[] colEdgeX = new float[5];   // Position of each column divider
+        // Column width ratios (sum to 1, adjustable by dragging): 0 name, 1 cache left, 2 speed, 3-6 the four number columns (Session view: Input / Output / Cache W / Cache R).
+        // In views without the cache-left / speed columns, the name column takes their place, or they hold the 5th number column (Compare view)
+        // Column 7 exists only in the Session view: cost (the API-equivalent amount of this session at official prices). A hidden column has width 0
+        private readonly double[] colFr = { 0.28, 0.11, 0.13, 0.12, 0.12, 0.12, 0.12, 0.12 };
+        private readonly float[] colWidth = new float[8];   // Width of each column in this draw (physical pixels)
+        private readonly float[] colEdgeX = new float[7];   // Positions of the divider on the right of each column
+        private readonly bool[] colOn = new bool[8];        // Whether each column is shown in this paint
+        private readonly int[] colNext = new int[8];        // Next shown column to the right of each column (-1 = none); when a divider is dragged the two trade width
         private float colInner = 1f;
         private float colTop, colBottom;
         private int colDrag = -1;                           // Which divider is being dragged (-1 = none)
         private int colDragX0;
-        private readonly double[] colDragStart = new double[6];
-        private readonly HashSet<string> expandedGroups = new HashSet<string>();     // Sessions expanded in the model view (session IDs)
-        private readonly List<KeyValuePair<RectangleF, string>> chevHits = new List<KeyValuePair<RectangleF, string>>();   // Positions of the arrow in the model view (click to expand / collapse)
+        private readonly double[] colDragStart = new double[8];
+        private readonly List<KeyValuePair<RectangleF, int>> headHits = new List<KeyValuePair<RectangleF, int>>();   // Position of each header cell (click to sort)
+        private RectangleF speedHeadRect = RectangleF.Empty;    // The "Speed" header of the Session view (click to pick the statistics window: 5 / 15 / 30 / 60 minutes or custom)
+        private int speedMin = 15;                              // Speed statistics window (minutes)
+        private readonly int[] sortCol = { -1, -1, -1 };        // Sort column of each of the Session / Model / Compare views (-1 = default order)
+        private readonly bool[] sortDesc = { true, true, true };
+        private int legacyMode = -1;                            // mode= in old settings (the view numbers changed, so convert it when there is no view=)
+        private bool sawView;
+        private Dictionary<string, SpeedInfo> speedBy;          // Session -> burn speed over the last speedMin minutes (computed at every repaint of the Session view)
+
+        private sealed class SpeedInfo
+        {
+            public double R5, Rw;       // Burn speed of the 5-hour / weekly quota (%/hour)
+            public double P5, Pw;       // Total 5-hour / weekly quota used in the window (percentage points) = speed x window hours (the "Share" column)
+            public double GP5, GPw;     // Gray: the share over a window of the same length ending at its last activity
+            public bool Known;          // A quota conversion coefficient exists and there was usage in this period
+            public bool GrayDone, HasGray;
+            public double G5, Gw;       // When there was no usage in this period: its average speed "while it was active" (the window ends at its last activity), shown in gray
+        }
+
+        private Dictionary<string, List<UsageTracker.RecentUse>> speedHist;     // Every message of every session in the last 8 days, read from the log (used when the speed window exceeds 3 hours, or for the average speed of idle sessions)
+        private DateTime speedHistUtc = DateTime.MinValue;
+        private bool speedHistBusy;
+        private DateTime speedNowUtc = DateTime.UtcNow;
+        private readonly List<KeyValuePair<RectangleF, UsageTracker.SessionTotal>> jumpHits = new List<KeyValuePair<RectangleF, UsageTracker.SessionTotal>>();   // The ↗ to the right of a session row's name (click to jump to the session window)
+
+        private bool speedApprox;       // The speed includes parts inferred from "official prices / plan multiplier" (marked with "≈" in the quota conversion)
+        // Cache reminders: status color of each session's cache, system notifications, the tray icon and the status dots on the cards
+        private bool alertsOn = true;                   // Show a system notification when a cache is about to expire (setting alert=)
+        private DateTime lastBgUsageUtc = DateTime.MinValue;
+        private readonly Dictionary<string, double> cacheRem = new Dictionary<string, double>();   // Session -> cache minutes left last time (to tell whether it has just dropped to within 10 minutes)
+        private int indicatorKey = -1;
+        private CacheState indicatorState = CacheState.None;
+        private int cUrgent, cSoon, cRunning, cWaiting;
+        private int trayDotKey = -1;
+        private IntPtr trayDotHandle = IntPtr.Zero;
+        private DetailPopup tierPopup;                  // The detail popup opened by clicking a session in the Model view
+        private string tierPopupSession = "";
+        private List<LogSummary.ApiTotal> apiRows;      // Data of the API view (all historical usage of non-Claude models called through an API)
+        private DateTime apiRefreshUtc = DateTime.MinValue;
+        private bool apiBusy;
         private readonly List<KeyValuePair<RectangleF, string>> sessionHits = new List<KeyValuePair<RectangleF, string>>();   // Position of each session row in the usage panel (click to drill down)
         private int winWu, winHu;               // Window size after the user dragged it (base units); 0 = use the default size
         private bool resizing;                  // Dragging an edge to resize
@@ -3611,12 +4045,13 @@ namespace Stilla
             }
 
             // The countdown is exact to the minute: if the text on screen did not change there is no redraw, so idle CPU use is close to nothing
-            if (DateTime.UtcNow - vsyncUtc > TimeSpan.FromMinutes(10))
+            if (Has(Feat.VSync) && !paused && DateTime.UtcNow - vsyncUtc > TimeSpan.FromMinutes(10))
             {
                 vsyncUtc = DateTime.UtcNow;
                 StartVsCodeSync();
             }
-            if (DateTime.UtcNow - quotaFitUtc > TimeSpan.FromHours(1))
+            // Recompute the quota conversion every hour; while the current basis has too little data of its own and the coefficients are inferred, recompute every 10 minutes (switch to the measured values as soon as there is enough data)
+            if (Has(Feat.Fit) && !paused && DateTime.UtcNow - quotaFitUtc > TimeSpan.FromMinutes((quota != null && (quota.PlanDerived || quota.Stale)) ? Cad().FitDerivedMin : Cad().FitMin))
             {
                 quotaFitUtc = DateTime.UtcNow;
                 StartQuotaFit();
@@ -3630,13 +4065,36 @@ namespace Stilla
             {
                 // No problem in account detection may affect the quota display
             }
+            TrimMemoryIfBig();
+            try
+            {
+                CheckWeeklyReport();
+            }
+            catch (Exception)
+            {
+            }
             RefreshUsage();
-            if (showUsage)
+            try
+            {
+                UpdateCacheIndicators();
+            }
+            catch (Exception)
+            {
+            }
+            if (showUsage && !paused)
             {
                 StartLogRefresh();
-                if (usageMode == 4)
+                if (usageMode == 0 || usageMode == 5)
+                {
+                    StartSpeedHistory();
+                }
+                if (usageMode == 3)
                 {
                     StartSubRefresh();
+                }
+                if (usageMode == 4)
+                {
+                    StartApiRefresh();
                 }
             }
             CheckRedraw();
@@ -3966,8 +4424,9 @@ namespace Stilla
             Quota five = data == null ? null : data.FiveHour;
             Quota week = data == null ? null : data.SevenDay;
 
+            tipHits.Clear();
             closeRect = new RectangleF(w - pad - 18f * s, 6f * s, 24f * s, 22f * s);
-            refreshRect = new RectangleF(closeRect.X - 52f * s, 6f * s, 50f * s, 22f * s);
+            refreshRect = new RectangleF(closeRect.X - 58f * s, 6f * s, 56f * s, 22f * s);
 
             CompactData d = new CompactData();
             d.Has5 = five != null;
@@ -4025,6 +4484,10 @@ namespace Stilla
             if (showUsage)
             {
                 DrawUsagePanel(g, w, h);
+            }
+            if (tipsOn)
+            {
+                BuildTips(w, h);        // Hover tips: which tip (Tips.cs) belongs to each area in this frame
             }
         }
 
@@ -4101,6 +4564,7 @@ namespace Stilla
             // Header: ink-drop icon + USAGE, with the view buttons on the right
             skin.DrawTitle(g, pad, top + 6f * s, "USAGE", FontsNow(), curPal, s);
             DrawModeSwitch(g, w, pad, top + 7f * s, s);
+            DrawPauseNote(g, pad, top, s);
 
             // Time tabs (liquid cups), then the big number and time range
             DrawTabStrip(g, shownTabs, pad, top + 34f * s, inner, s);
@@ -4108,85 +4572,176 @@ namespace Stilla
             DrawTextRect(g, UsageTracker.FormatTokens(cur.Total), fBig, TextMain, new RectangleF(pad, top + 98f * s, inner * 0.4f, 26f * s), StringAlignment.Near);
             DrawTextRect(g, "TOKENS · " + cur.Range, fSmall, TextDim, new RectangleF(pad + inner * 0.4f, top + 104f * s, inner * 0.6f, 16f * s), StringAlignment.Far);
 
-            // Columns: session name (left) | cache left (middle) | input output cache W cache R (right)
             sessionHits.Clear();
-            // Column widths are shared out by ratio (the dividers can be dragged on the card): session name | cache left | input | output | cache write | cache read
-            // Every column first gets its minimum width (so numbers are never squeezed out when the window is narrowed); the remaining width is shared out by ratio
-            double frSum = 0;
-            for (int i = 0; i < 6; i++)
+            headHits.Clear();
+            jumpHits.Clear();
+            speedHeadRect = RectangleF.Empty;
+            occHeadRect = RectangleF.Empty;
+            gripRect = RectangleF.Empty;
+            healthRect = RectangleF.Empty;
+            mailBtnRect = RectangleF.Empty;
+            tipForecast = RectangleF.Empty;
+            tipDs = RectangleF.Empty;
+            tipYTotal = -1f;
+            tipRowsN = 0;
+            tipRowsOther = false;
+            tipInfoY = -1f;
+            tipInfoN = 0;
+            if (usageMode == 5)
             {
-                frSum += colFr[i];
+                moreRect = RectangleF.Empty;
+                speedBy = null;
+                DrawTrendView(g, pad, inner, s, top);
+                return;
             }
-            float[] mins = { 120f * s, 56f * s, 44f * s, 44f * s, 44f * s, 44f * s };
-            float minSum = 0;
-            for (int i = 0; i < 6; i++)
+            // Column widths are shared out by ratio (the dividers can be dragged on the card): name | cache left | speed | four number columns
+            // Every column first gets its minimum width (so numbers are never squeezed out when the window is narrowed); the remaining width is shared out by ratio
+            // Columns of the Session view can be hidden in settings (smask); column 7 (cost) exists only in the Session view. A hidden column has width 0 and its width goes to the other columns
+            for (int i = 0; i < 8; i++)
             {
-                minSum += mins[i];
+                colOn[i] = usageMode == 0 ? (i == 0 || (smask & (1 << ColBitOf[i])) != 0) : i < 7;
+            }
+            float[] mins = usageMode == 0 ? new float[] { 120f * s, 68f * s, 70f * s, 78f * s, 52f * s, 52f * s, 52f * s, 52f * s }
+                : new float[] { 120f * s, 64f * s, 70f * s, 52f * s, 52f * s, 52f * s, 52f * s, 56f * s };
+            // the header text plus the sort caret must always fit (no "Cache le..."): every column is at least as wide as its header
+            int headFrom = usageMode == 0 ? 1 : usageMode == 2 ? 2 : 3;
+            float headGw = usageMode <= 2 ? 14f * s : 0f;
+            for (int i = headFrom; i < 8; i++)
+            {
+                if (colOn[i])
+                {
+                    mins[i] = Math.Max(mins[i], TextW(g, HeadText(usageMode, i), fSmall) + headGw + 3f * s);
+                }
+            }
+            float minSum = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                minSum += colOn[i] ? mins[i] : 0;
+            }
+            if (usageMode == 0)
+            {
+                // window too narrow for all columns: hide the least important ones for this frame (the settings stay as they are, they come back when the window is widened): input, cache write, cache read, share, output, speed
+                int[] dropOrder = { 4, 6, 7, 3, 5, 2 };
+                foreach (int dc in dropOrder)
+                {
+                    if (minSum <= inner + 0.5f)
+                    {
+                        break;
+                    }
+                    if (colOn[dc])
+                    {
+                        colOn[dc] = false;
+                        minSum -= mins[dc];
+                    }
+                }
+            }
+            double frSum = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                frSum += colOn[i] ? colFr[i] : 0;
             }
             float shrink = minSum > inner ? inner / minSum : 1f;
             float remain = inner - minSum * shrink;
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 8; i++)
             {
-                colWidth[i] = mins[i] * shrink + remain * (float)(colFr[i] / frSum);
+                colWidth[i] = colOn[i] ? mins[i] * shrink + remain * (float)(colFr[i] / frSum) : 0f;
             }
             colInner = inner;
             float edgeX = pad;
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < 7; i++)
             {
                 edgeX += colWidth[i];
                 colEdgeX[i] = edgeX;
             }
-            colTop = top + 128f * s;
-            colBottom = top + UsagePanelH * s;
-            using (Pen divPen = new Pen(Track))
+            for (int i = 0; i < 8; i++)
             {
-                for (int i = usageMode == 0 ? 0 : 1; i < (usageMode == 4 ? 0 : 5); i++)
+                colNext[i] = -1;
+                for (int j = i + 1; j < 8; j++)
                 {
-                    g.DrawLine(divPen, colEdgeX[i], colTop, colEdgeX[i], colBottom);
+                    if (colOn[j])
+                    {
+                        colNext[i] = j;
+                        break;
+                    }
                 }
             }
+            colTop = top + 128f * s;
+            colBottom = top + UsagePanelH * s;
             float nameW = colWidth[0];
             float cacheW = colWidth[1];
-            float colW = colWidth[2];
+            float extraW = colWidth[2];
+            float colW = colWidth[3];
             float headY = top + 128f * s;
-            float rowH = 16f * s;
-            string[] heads = usageMode == 0 ? new string[] { "Input", "Output", "Cache W", "Cache R" }
-                : usageMode == 1 ? new string[] { "token", "5h est.", "Wk est.", "Cache R" }
-                : usageMode == 3 ? new string[] { "Msgs", "Output", "Think", "5h est." }
-                : usageMode == 4 ? new string[] { "Period use", "Fee", "Payback", "Renews" }
-                : new string[] { "token", "Share", "5h est.", "Mult." };
-            DrawTextRect(g, usageMode == 0 ? "Session" : usageMode == 1 ? "Model" : usageMode == 3 ? "Tier" : usageMode == 4 ? "Account" : "Compare", fSmall, TextDim, new RectangleF(pad, headY, nameW, 14f * s), StringAlignment.Near);
+            float rowH = rowHu * s;          // Row height can be changed by dragging the divider above the "Total" row
+
+            // Burn speed of the Session view (last speedMin minutes, converted to %/hour by the quota conversion)
+            double tot5 = 0, totW = 0;
+            bool speedKnown = false;
+            speedBy = null;
             if (usageMode == 0)
             {
-                DrawTextRect(g, "Expires", fSmall, TextDim, new RectangleF(pad + nameW, headY, cacheW, 14f * s), StringAlignment.Far);
+                LoadQuota();
+                speedBy = ComputeSpeeds(DateTime.UtcNow, out tot5, out totW, out speedKnown);
+                tipTot5 = tot5;
+                tipTotW = totW;
+                tipSpeedKnown = speedKnown;
             }
-            DrawRowNumbers(g, pad, inner, colW, headY, 14f * s, heads, TextDim);
 
-            // How many rows fit at the current window height (two rows are kept below for total and cost); a taller window shows more
+            // How many rows fit in the current window height (room is left below for the total, cap forecast and cost); a taller window shows more
             float panelH = h / s - CompactH();
-            int capacity = (int)Math.Floor((panelH - 182f) / 16f);
-            int cap = Math.Max(1, capacity - (usageMode == 4 ? 1 : 0));
+            // The header and liquid cups take 150; the 2-3 rows below (total, cap forecast, cost) are counted by row height too
+            int cap = Math.Max(1, (int)Math.Floor((panelH - 150f) / rowHu) - (usageMode == 0 || usageMode >= 3 ? 3 : 2));
 
             moreRect = RectangleF.Empty;
-            List<UsageTracker.SessionTotal> rows = SortedSessions(cur);
+            List<UsageTracker.SessionTotal> rows = usageMode == 0 ? SortedSessions(cur) : new List<UsageTracker.SessionTotal>();
+            if (usageMode == 0 && sortCol[0] >= 0)
+            {
+                ApplySessionSort(rows);
+            }
             float y = top + 146f * s;
+            // column dividers and headers: in the session view the dividers stop at the total row, the forecast / health / cost lines below are full-width text
+            float divBottom = colBottom;
+            if (usageMode == 0)
+            {
+                int shown0 = 1;
+                if (rows.Count > 0)
+                {
+                    int start0;
+                    bool more0, collapse0;
+                    RowWindow(rows.Count, cap, out start0, out shown0, out more0, out collapse0);
+                    shown0 += more0 || collapse0 ? 1 : 0;
+                }
+                divBottom = Math.Min(h - 4f * s, y + shown0 * rowH + 3f * s + rowH + 1f * s);
+            }
+            DrawDividers(g, divBottom);
+            DrawColumnHeaders(g, pad, headY, s);
             int drawn = 0;
             if (usageMode == 1)
             {
-                drawn = DrawModelRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                drawn = DrawModelRows(g, cur, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
             }
             else if (usageMode == 2)
             {
-                drawn = DrawCompareRows(g, cur, pad, inner, s, colW, nameW, y, rowH, cap);
+                drawn = DrawCompareRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
             }
             else if (usageMode == 3)
             {
-                drawn = DrawTierRows(g, cur, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
+                drawn = DrawSubscriptionRows(g, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
+                DrawRowGrip(g, pad, inner, s, y + drawn * rowH + 1.5f * s, drawn, true);
+                DrawSubscriptionInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
+                return;
             }
             else if (usageMode == 4)
             {
-                drawn = DrawSubscriptionRows(g, pad, inner, s, colW, nameW + cacheW, y, rowH, cap);
-                DrawSubscriptionInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
+                drawn = DrawApiRows(g, pad, inner, s, colW, nameW + cacheW + extraW, y, rowH, cap);
+                tipRowsY = y;
+                tipRowsN = drawn;
+                DrawRowGrip(g, pad, inner, s, y + drawn * rowH + 1.5f * s, drawn, true);
+                DrawApiInfo(g, pad, inner, s, y + drawn * rowH + 4f * s, rowH);
                 return;
             }
             else if (rows.Count == 0)
@@ -4218,42 +4773,842 @@ namespace Stilla
                         rCr += rows[i].CacheRead;
                     }
                     DrawMoreRow(g, "▾ " + (rowN - rowShown) + " more", Numbers(rIn, rOut, rCw, rCr), pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
+                    if (colWidth[3] >= 1f)
+                    {
+                        double rest5 = 0, restW = 0;
+                        for (int i = rowShown; i < rowN; i++)
+                        {
+                            SpeedInfo rsi;
+                            if (speedBy != null && speedBy.TryGetValue(rows[i].Session, out rsi) && rsi.Known)
+                            {
+                                rest5 += rsi.P5;
+                                restW += rsi.Pw;
+                            }
+                        }
+                        DrawTextFit(g, rest5 > 0 || restW > 0 ? OccText(rest5, restW) : "", fSmall, TextDim,
+                            new RectangleF(pad + nameW + cacheW + colWidth[2], y + drawn * rowH, colWidth[3], rowH), StringAlignment.Far);
+                    }
                     drawn++;
                 }
                 else if (rowCollapse)
                 {
-                    DrawMoreRow(g, rowN > rowShown ? "▴ Collapse · scroll to page" : "▴ Collapse", null, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
+                    DrawMoreRow(g, rowN > rowShown ? "▴ Collapse · scroll" : "▴ Collapse", null, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
                     drawn++;
                 }
             }
 
             // Total row: the total of this time range (matches the header)
             float yTotal = y + drawn * rowH + 3f * s;
+            tipYTotal = yTotal;
             using (Pen p = new Pen(Track))
             {
                 g.DrawLine(p, pad, yTotal - 2f * s, w - pad, yTotal - 2f * s);
+            }
+            DrawRowGrip(g, pad, inner, s, yTotal - 2f * s, drawn, false);
+            if (usageMode != 0)
+            {
+                ExtendDividers(g, h, yTotal + rowH * 2f + 2f * s);       // After the row height is enlarged the table may be taller than the original panel: the vertical dividers are extended with it
             }
             DrawTextRect(g, "Total", fSmall, TextMain, new RectangleF(pad, yTotal, nameW, rowH), StringAlignment.Near);
             if (usageMode >= 1 && quota != null && quota.CalibErr >= 0)
             {
                 // Self-check of the quota conversion: every block of data is fitted on the data before it and then predicted; this is the mean relative error of the latest blocks
-                DrawTextRect(g, "Est. error ~" + (quota.CalibErr * 100).ToString("0", CultureInfo.InvariantCulture) + "%", fSmall, TextDim,
+                DrawTextFit(g, "Est. error ~" + (quota.CalibErr * 100).ToString("0", CultureInfo.InvariantCulture) + "%", fSmall, TextDim,
                     new RectangleF(pad + 34f * s, yTotal, nameW - 34f * s, rowH), StringAlignment.Near);
             }
-            string[] totalNums = usageMode == 0 ? Numbers(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead)
-                : usageMode == 1 ? new string[] { UsageTracker.FormatTokens(cur.Total), TotalEstimateText(cur, false), TotalEstimateText(cur, true), UsageTracker.FormatTokens(cur.CacheRead) }
-                : usageMode == 3 ? TierTotalNums(cur)
-                : new string[] { UsageTracker.FormatTokens(cur.Total), cur.Total > 0 ? "100%" : "", TotalEstimateText(cur, false), "" };
-            DrawRowNumbers(g, pad, inner, colW, yTotal, rowH, totalNums, TextMain);
+            if (usageMode == 2)
+            {
+                long tOut = 0, tThink = 0;
+                foreach (UsageTracker.TierTotal tt in cur.TierRows)
+                {
+                    tOut += tt.Out;
+                    tThink += tt.Think;
+                }
+                DrawRowNumbers5(g, pad, inner, colW, yTotal, rowH, new string[]
+                {
+                    UsageTracker.FormatTokens(cur.Total), UsageTracker.FormatTokens(tOut), UsageTracker.FormatTokens(tThink), TotalEstimateText(cur, false), ""
+                }, TextMain);
+            }
+            else
+            {
+                string[] totalNums = usageMode == 0 ? Numbers(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead)
+                    : new string[] { UsageTracker.FormatTokens(cur.Total), TotalEstimateText(cur, false), TotalEstimateText(cur, true), UsageTracker.FormatTokens(cur.CacheRead) };
+                DrawRowNumbers(g, pad, inner, colW, yTotal, rowH, totalNums, TextMain);
+                if (usageMode == 0 && colWidth[3] >= 1f)
+                {
+                    // Total of the "Share" column: the quota used by all sessions (including those not in the list) in the last N minutes
+                    DrawTextFit(g, speedKnown ? OccText(occ5, occW) : "—", fSmall, TextMain,
+                        new RectangleF(pad + nameW + cacheW + colWidth[2], yTotal, colWidth[3], rowH), StringAlignment.Far);
+                }
+            }
+            if (usageMode == 0 && Has(Feat.Health) && Show(Feat.HealthBadge))
+            {
+                // Small estimate self-check hint in the name cell of the total row (click it for details)
+                HealthInfo hb = GetHealth();
+                if (hb.Short.Length > 0)
+                {
+                    RectangleF hr = new RectangleF(pad + 34f * s, yTotal, Math.Max(10f * s, nameW - 34f * s), rowH);
+                    DrawTextFit(g, hb.Short, fSmall, HealthColor(hb), hr, StringAlignment.Near);
+                    healthRect = hr;
+                }
+            }
+            float yNext = yTotal + rowH + 1f * s;
+            if (usageMode == 0)
+            {
+                // The "Speed" cell of the total row: combined burn speed of all sessions; the next row: how long it can run at this speed before hitting the cap
+                if (extraW >= 1f)
+                {
+                    DrawTextFit(g, SpeedText(speedKnown, tot5, totW), fSmall, TextMain, new RectangleF(pad + nameW + cacheW, yTotal, extraW, rowH), StringAlignment.Far);
+                }
+                if (Show(Feat.Forecast))
+                {
+                    bool risk;
+                    string forecast = SpeedForecast(tot5, totW, speedKnown, out risk);
+                    DrawTextFit(g, forecast, fSmall, risk ? StateColor(CacheState.Urgent) : TextDim, new RectangleF(pad, yNext, inner, rowH), StringAlignment.Near);
+                    tipForecast = new RectangleF(pad, yNext, inner, rowH);
+                    yNext += rowH;
+                }
+            }
 
-            // Last row: the cost estimated at DeepSeek off-peak prices ("what these tokens would cost on DeepSeek"), hidden by default, can be enabled from the right-click menu
-            if (showDeepSeek)
+            // Last row: when the estimate self-check finds a large deviation it shows a warning; otherwise it shows the cost estimated at DeepSeek off-peak prices (can be turned off in settings)
+            HealthInfo hw = (Has(Feat.Health) && Show(Feat.HealthBadge)) ? GetHealth() : null;
+            if (hw != null && hw.Level >= 2)
+            {
+                RectangleF wr = new RectangleF(pad, yNext, inner, rowH);
+                DrawTextFit(g, hw.Line, fSmall, HealthColor(hw), wr, StringAlignment.Near);
+                healthRect = wr;
+            }
+            else if (Show(Feat.DsLine))
             {
                 double cost = EstimateCostCny(cur.Input, cur.Output, cur.CacheWrite, cur.CacheRead);
-                float yCost = yTotal + rowH + 1f * s;
-                DrawTextRect(g, "DeepSeek off-peak price estimate (Flash)", fSmall, TextDim, new RectangleF(pad, yCost, inner * 0.7f, rowH), StringAlignment.Near);
-                DrawTextRect(g, "¥" + cost.ToString("0.00", CultureInfo.InvariantCulture), fLabel, TextMain, new RectangleF(pad + inner * 0.6f, yCost - 2f * s, inner * 0.4f, rowH + 4f * s), StringAlignment.Far);
+                tipDs = new RectangleF(pad, yNext, inner, rowH);
+                DrawTextRect(g, "DeepSeek off-peak price estimate (Flash)", fSmall, TextDim, new RectangleF(pad, yNext, inner * 0.7f, rowH), StringAlignment.Near);
+                DrawTextRect(g, "¥" + cost.ToString("0.00", CultureInfo.InvariantCulture), fLabel, TextMain, new RectangleF(pad + inner * 0.6f, yNext - 2f * s, inner * 0.4f, rowH + 4f * s), StringAlignment.Far);
             }
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr min, IntPtr max);
+
+        private DateTime trimUtc = DateTime.MinValue;
+
+        // Background log reading and parsing of large files leave a lot of garbage, and the working set can grow to over 200 MB. Above 120 MB, reclaim memory in the background every 2 minutes (only when above)
+        private void TrimMemoryIfBig()
+        {
+            if (!Has(Feat.Trim) || DateTime.UtcNow - trimUtc < TimeSpan.FromMinutes(2) || Environment.WorkingSet < 120L * 1024 * 1024)
+            {
+                return;
+            }
+            trimUtc = DateTime.UtcNow;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, (IntPtr)(-1), (IntPtr)(-1));
+                }
+                catch (Exception)
+                {
+                }
+            });
+        }
+
+        // First divider to draw / drag: in the Session view it starts at name | cache left; in the Compare view the name column spans the first two columns; in other views the first three
+        private int FirstEdge()
+        {
+            return usageMode == 0 ? 0 : usageMode == 2 ? 1 : 2;
+        }
+
+        // ---------------------------------------------------------------- header, sorting, speed
+        private string HeadText(int mode, int col)
+        {
+            switch (mode)
+            {
+                case 0:
+                    return col == 1 ? "Expires" : col == 2 ? "Speed " + SpeedLabel(speedMin) : col == 3 ? "Share " + SpeedLabel(speedMin) : col == 4 ? "Input" : col == 5 ? "Output" : col == 6 ? "Cache W" : "Cache R";
+                case 1:
+                    return col == 3 ? "token" : col == 4 ? "5h est." : col == 5 ? "Wk est." : "Cache R";
+                case 2:
+                    return col == 2 ? "token" : col == 3 ? "Output" : col == 4 ? "Think" : col == 5 ? "5h est." : "Mult.";
+                case 3:
+                    return col == 3 ? "Period use" : col == 4 ? "Fee" : col == 5 ? "Payback" : "Renews";
+                default:
+                    return col == 3 ? "Msgs" : col == 4 ? "Input" : col == 5 ? "Output" : "Est. cost";
+            }
+        }
+
+        private void DrawColumnHeaders(Graphics g, float pad, float headY, float s)
+        {
+            float hh = 14f * s;
+            string nameHead = usageMode == 0 ? "Session" : usageMode == 1 ? "Model" : usageMode == 2 ? "Model / tier" : usageMode == 3 ? "Account" : "API model";
+            int nameSpan = usageMode == 0 ? 1 : usageMode == 2 ? 2 : 3;
+            float nameWidth = 0;
+            for (int i = 0; i < nameSpan; i++)
+            {
+                nameWidth += colWidth[i];
+            }
+            bool sortable = usageMode <= 2;
+            DrawHeaderCell(g, nameHead, 0, pad, nameWidth, headY, hh, StringAlignment.Near, sortable, s);
+            if (usageMode == 0)
+            {
+                DrawMailButton(g, pad + 53f * s, headY, hh, s);       // The "@" at the top of the session column: email reminder settings
+            }
+            float x = pad + nameWidth;
+            for (int c = nameSpan; c < 8; c++)
+            {
+                if (colWidth[c] < 1f)
+                {
+                    continue;       // Hidden column
+                }
+                DrawHeaderCell(g, HeadText(usageMode, c), c, x, colWidth[c], headY, hh, StringAlignment.Far, sortable, s);
+                x += colWidth[c];
+            }
+        }
+
+        // One header cell: text + the small sort buttons on the right (▲▼). The sorted column's text uses the normal color and its small button is highlighted; the whole cell is clickable
+        private void DrawHeaderCell(Graphics g, string text, int col, float x, float w, float y, float h, StringAlignment align, bool sortable, float s)
+        {
+            float gw = sortable ? 14f * s : 0f;
+            bool active = sortable && sortCol[usageMode] == col;
+            DrawTextFit(g, text, fSmall, active ? TextMain : TextDim, new RectangleF(x, y, Math.Max(10f * s, w - gw - 1f * s), h), align);
+            if (!sortable)
+            {
+                return;
+            }
+            DrawSortGlyph(g, new RectangleF(x + w - gw, y, gw, h), active ? (sortDesc[usageMode] ? 2 : 1) : 0, s);
+            headHits.Add(new KeyValuePair<RectangleF, int>(new RectangleF(x, y - 2f * s, w, h + 4f * s), col));
+            if (usageMode == 0 && col == 2)
+            {
+                speedHeadRect = new RectangleF(x, y - 2f * s, Math.Max(10f * s, w - gw), h + 4f * s);
+            }
+            if (usageMode == 0 && col == 3)
+            {
+                occHeadRect = new RectangleF(x, y - 2f * s, Math.Max(10f * s, w - gw), h + 4f * s);
+            }
+        }
+
+        // state: 0 = not sorted (two faint small triangles), 1 = ascending (▲ lit), 2 = descending (▼ lit)
+        private void DrawSortGlyph(Graphics g, RectangleF r, int state, float s)
+        {
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            float a = 3.2f * s;
+            Color dim = SkinDraw.Mix(Bg, TextDim, 0.45f);
+            using (SolidBrush up = new SolidBrush(state == 1 ? TextMain : dim))
+            using (SolidBrush dn = new SolidBrush(state == 2 ? TextMain : dim))
+            {
+                g.FillPolygon(up, new PointF[] { new PointF(cx - a, cy - 1.2f * s), new PointF(cx + a, cy - 1.2f * s), new PointF(cx, cy - 1.2f * s - a * 1.3f) });
+                g.FillPolygon(dn, new PointF[] { new PointF(cx - a, cy + 1.2f * s), new PointF(cx + a, cy + 1.2f * s), new PointF(cx, cy + 1.2f * s + a * 1.3f) });
+            }
+        }
+
+        private UsageTracker.SessionTotal JumpAt(Point p)
+        {
+            if (!showUsage || usageMode != 0)
+            {
+                return null;
+            }
+            foreach (KeyValuePair<RectangleF, UsageTracker.SessionTotal> h in jumpHits)
+            {
+                if (h.Key.Contains(p))
+                {
+                    return h.Value;
+                }
+            }
+            return null;
+        }
+
+        // Jump to the window of this session (for VS Code: switch to the VS Code window whose title contains the session's folder name, then ask the extension to open / return to this session;
+        // for a terminal: switch to its terminal window). Runs on a background thread; cases such as "window not found" are reported with a tray notification
+        private void JumpToSession(UsageTracker.SessionTotal t)
+        {
+            string id = t.Session, name = t.Name;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg;
+                try
+                {
+                    msg = SessionJump.Go(id, name);
+                }
+                catch (Exception ex)
+                {
+                    msg = "Jump failed: " + ex.Message;
+                }
+                if (msg != null)
+                {
+                    try
+                    {
+                        BeginInvoke(new MethodInvoker(delegate { Balloon("Jump to session", msg); }));
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            });
+        }
+
+        // Which header cell the mouse is over (only the Session / Model / Compare views can sort); -1 if none
+        private int HeadAt(Point p)
+        {
+            if (!showUsage || usageMode > 2)
+            {
+                return -1;
+            }
+            foreach (KeyValuePair<RectangleF, int> hh in headHits)
+            {
+                if (hh.Key.Contains(p))
+                {
+                    return hh.Value;
+                }
+            }
+            return -1;
+        }
+
+        // Click a header: the first click sorts descending (time = newest first, usage = largest first; the name column of the Compare view is A-Z), a second click reverses it, a third restores the default order
+        private void ToggleSort(int col)
+        {
+            int m = usageMode;
+            if (m > 2)
+            {
+                return;
+            }
+            bool firstDesc = !(m == 2 && col == 0);
+            if (sortCol[m] != col)
+            {
+                sortCol[m] = col;
+                sortDesc[m] = firstDesc;
+            }
+            else if (sortDesc[m] == firstDesc)
+            {
+                sortDesc[m] = !firstDesc;
+            }
+            else
+            {
+                sortCol[m] = -1;
+                sortDesc[m] = true;
+            }
+            CollapseRows();
+            Redraw();
+            SaveSettings();
+        }
+
+        // Stable sort: rows without a value always go last; rows with equal values keep their original order
+        private static void SortStable<T>(List<T> list, Func<T, double?> key, bool desc)
+        {
+            List<KeyValuePair<double?, int>> ks = new List<KeyValuePair<double?, int>>(list.Count);
+            for (int i = 0; i < list.Count; i++)
+            {
+                ks.Add(new KeyValuePair<double?, int>(key(list[i]), i));
+            }
+            ks.Sort(delegate(KeyValuePair<double?, int> a, KeyValuePair<double?, int> b)
+            {
+                if (!a.Key.HasValue || !b.Key.HasValue)
+                {
+                    if (a.Key.HasValue != b.Key.HasValue)
+                    {
+                        return a.Key.HasValue ? -1 : 1;
+                    }
+                    return a.Value.CompareTo(b.Value);
+                }
+                int c = a.Key.Value.CompareTo(b.Key.Value);
+                if (desc)
+                {
+                    c = -c;
+                }
+                return c != 0 ? c : a.Value.CompareTo(b.Value);
+            });
+            List<T> copy = new List<T>(list);
+            for (int i = 0; i < ks.Count; i++)
+            {
+                list[i] = copy[ks[i].Value];
+            }
+        }
+
+        private double? SessionSortKey(UsageTracker.SessionTotal t, int col, DateTime now)
+        {
+            UsageTracker.LiveInfo li;
+            usageSnap.Live.TryGetValue(t.Session, out li);
+            switch (col)
+            {
+                case 0:
+                    return (double)Math.Max(t.LastUtc.Ticks, li != null ? li.LastUtc.Ticks : 0);     // Time of the latest activity
+                case 1:
+                    {
+                        double rem;
+                        CacheState st = StateOf(li, t.Active, t.CacheExpiryUtc, now, out rem);
+                        if (st == CacheState.Running)
+                        {
+                            return 1000000;                 // Running: the cache keeps renewing
+                        }
+                        return st == CacheState.None ? (double?)null : rem;     // Expired / no cache: always last
+                    }
+                case 2:
+                    {
+                        SpeedInfo si = SpeedFor(t.Session);
+                        if (si != null && si.Known && (si.R5 > 0 || si.Rw > 0))
+                        {
+                            return 1e12 + si.R5 * 1000 + si.Rw;      // Rows with usage in the current window go first (compare the 5-hour quota speed first, then the weekly one)
+                        }
+                        return si != null && si.HasGray ? si.G5 * 1000 + si.Gw : (double?)null;     // Then the gray historical average speeds; rows without one always go last
+                    }
+                case 3:
+                    {
+                        SpeedInfo oi = SpeedFor(t.Session);
+                        if (oi != null && oi.Known && (oi.P5 > 0 || oi.Pw > 0))
+                        {
+                            return 1e12 + oi.P5 * 1000 + oi.Pw;      // Rows with a share in the window go first (compare the 5-hour quota first, then the weekly one), then the gray ones
+                        }
+                        return oi != null && oi.HasGray ? oi.GP5 * 1000 + oi.GPw : (double?)null;
+                    }
+                case 4: return t.Input;
+                case 5: return t.Output;
+                case 6: return t.CacheWrite;
+                case 7: return t.CacheRead;
+            }
+            return null;
+        }
+
+        private void ApplySessionSort(List<UsageTracker.SessionTotal> rows)
+        {
+            int col = sortCol[0];
+            DateTime now = DateTime.UtcNow;
+            SortStable<UsageTracker.SessionTotal>(rows, delegate(UsageTracker.SessionTotal t) { return SessionSortKey(t, col, now); }, sortDesc[0]);
+        }
+
+        private double GroupPct(ModelGroup grp, bool week, out bool any)
+        {
+            double sum = 0;
+            any = false;
+            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+            {
+                double pct;
+                bool ap;
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, week, out pct, out ap))
+                {
+                    sum += pct;
+                    any = true;
+                }
+            }
+            return sum;
+        }
+
+        private void ApplyGroupSort(List<ModelGroup> groups)
+        {
+            int col = sortCol[1];
+            SortStable<ModelGroup>(groups, delegate(ModelGroup grp)
+            {
+                bool any;
+                switch (col)
+                {
+                    case 0:
+                        {
+                            long last = 0;
+                            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+                            {
+                                last = Math.Max(last, mt.LastUtc.Ticks);
+                            }
+                            return (double)last;
+                        }
+                    case 3: return grp.Total;
+                    case 4:
+                        {
+                            double v = GroupPct(grp, false, out any);
+                            return any ? v : (double?)null;
+                        }
+                    case 5:
+                        {
+                            double v = GroupPct(grp, true, out any);
+                            return any ? v : (double?)null;
+                        }
+                    case 6: return grp.CacheRead;
+                }
+                return null;
+            }, sortDesc[1]);
+        }
+
+        private void ApplyCompareSort(List<TierItem> items, Dictionary<TierItem, double> rate)
+        {
+            int col = sortCol[2];
+            List<string> names = new List<string>();
+            foreach (TierItem it in items)
+            {
+                string n = ShortModel(it.Model);
+                if (!names.Contains(n))
+                {
+                    names.Add(n);
+                }
+            }
+            names.Sort(StringComparer.Ordinal);
+            SortStable<TierItem>(items, delegate(TierItem it)
+            {
+                switch (col)
+                {
+                    case 0: return names.IndexOf(ShortModel(it.Model)) * 10 + TierRank(it.Tier);
+                    case 2: return it.Total;
+                    case 3: return it.Out;
+                    case 4: return it.Think;
+                    case 5: return it.HasPct ? it.Pct : (double?)null;
+                    case 6:
+                        {
+                            double r;
+                            return rate.TryGetValue(it, out r) ? r : (double?)null;
+                        }
+                }
+                return null;
+            }, sortDesc[2]);
+        }
+
+        private void DrawJumpIcon(Graphics g, RectangleF r, float s)
+        {
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f, a = 3.6f * s, h = 3.2f * s;
+            using (Pen p = new Pen(SkinDraw.Mix(Bg, TextDim, 0.9f), 1.3f * s))
+            {
+                g.DrawLine(p, cx - a, cy + a, cx + a, cy - a);
+                g.DrawLine(p, cx + a - h, cy - a, cx + a, cy - a);
+                g.DrawLine(p, cx + a, cy - a, cx + a, cy - a + h);
+            }
+        }
+
+        // Quota burned by each session in the last speedMin minutes, converted to "%/hour": its messages in this period converted by the quota conversion (with the tier correction), summed, divided by the window length.
+        // The window is measured in wall-clock time (not just the minutes the session was active): so an idle session's speed decays, and the total can be used directly to estimate "how long it can keep running at this speed".
+        // Messages from the last 3 hours come from live tracking, older ones from the history read from the log (speedHist); the two are split by time so nothing is counted twice
+        private Dictionary<string, SpeedInfo> ComputeSpeeds(DateTime nowUtc, out double tot5, out double totW, out bool known)
+        {
+            Dictionary<string, SpeedInfo> d = new Dictionary<string, SpeedInfo>();
+            tot5 = 0;
+            totW = 0;
+            known = false;
+            occ5 = 0;
+            occW = 0;
+            speedApprox = false;
+            speedNowUtc = nowUtc;
+            DateTime from = nowUtc.AddMinutes(-speedMin);
+            double hours = speedMin / 60.0;
+            DateTime ks = KeyStart();
+            if (ks > from)
+            {
+                // When the window is longer than "since the plan changed": count only what happened after the change, and divide by that actual time (at least 5 minutes, so the speed is not inflated right after a change)
+                from = ks;
+                hours = Math.Max((nowUtc - from).TotalHours, Math.Min(speedMin / 60.0, 5.0 / 60.0));
+            }
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                SpeedInfo si = new SpeedInfo();
+                double p5, pw;
+                if (SumPct(kv.Key, kv.Value, from, nowUtc, out p5, out pw))
+                {
+                    si.Known = true;
+                    si.R5 = p5 / hours;
+                    si.Rw = pw / hours;
+                    si.P5 = p5;
+                    si.Pw = pw;
+                    occ5 += p5;
+                    occW += pw;
+                    tot5 += si.R5;
+                    totW += si.Rw;
+                    known = true;
+                }
+                d[kv.Key] = si;
+            }
+            // When the window exceeds 3 hours, the total also adds sessions that are "no longer in the session list" (present in the log history, absent from live tracking): the total is the burn speed of the whole account, not just the rows in the list
+            if (speedMin > 180 && speedHist != null)
+            {
+                foreach (KeyValuePair<string, List<UsageTracker.RecentUse>> kv in speedHist)
+                {
+                    double p5, pw;
+                    if (!usageSnap.Live.ContainsKey(kv.Key) && SumPct(kv.Key, null, from, nowUtc, out p5, out pw))
+                    {
+                        tot5 += p5 / hours;
+                        totW += pw / hours;
+                        occ5 += p5;
+                        occW += pw;
+                        known = true;
+                    }
+                }
+            }
+            return d;
+        }
+
+        private bool AddUse(UsageTracker.RecentUse u, ref double p5, ref double pw)
+        {
+            if (u.Utc < KeyStart())
+            {
+                return false;       // Usage from before an account / plan change used a different quota, so it is not counted in the current basis' speed
+            }
+            double p;
+            bool ap;
+            bool ok = false;
+            if (TierPct(u.Model, u.Tier, u.Tok, false, out p, out ap))
+            {
+                p5 += p;
+                ok = true;
+                speedApprox = speedApprox || ap;
+            }
+            if (TierPct(u.Model, u.Tier, u.Tok, true, out p, out ap))
+            {
+                pw += p;
+            }
+            return ok;
+        }
+
+        // Convert this session's messages in [from, to] (UTC) into quota percentage points (5-hour / weekly). Returns true only if a quota conversion coefficient exists
+        private bool SumPct(string session, UsageTracker.LiveInfo li, DateTime from, DateTime to, out double p5, out double pw)
+        {
+            p5 = 0;
+            pw = 0;
+            bool known = false;
+            DateTime histCut = speedNowUtc.AddMinutes(-180);
+            if (li != null)
+            {
+                foreach (UsageTracker.RecentUse u in li.Recent)
+                {
+                    if (u.Utc >= from && u.Utc <= to)
+                    {
+                        known |= AddUse(u, ref p5, ref pw);
+                    }
+                }
+            }
+            List<UsageTracker.RecentUse> hl;
+            if (from < histCut && speedHist != null && speedHist.TryGetValue(session, out hl))
+            {
+                for (int i = hl.Count - 1; i >= 0; i--)
+                {
+                    UsageTracker.RecentUse u = hl[i];
+                    if (u.Utc >= histCut || u.Utc > to)
+                    {
+                        continue;
+                    }
+                    if (u.Utc < from)
+                    {
+                        break;
+                    }
+                    known |= AddUse(u, ref p5, ref pw);
+                }
+            }
+            return known;
+        }
+
+        // Time (UTC) of this session's latest activity: the newest message in live tracking, otherwise the newest one in the log history
+        private DateTime LastActivity(string session, UsageTracker.LiveInfo li)
+        {
+            DateTime last = DateTime.MinValue;
+            if (li != null)
+            {
+                foreach (UsageTracker.RecentUse u in li.Recent)
+                {
+                    if (u.Utc > last)
+                    {
+                        last = u.Utc;
+                    }
+                }
+            }
+            List<UsageTracker.RecentUse> hl;
+            if (last == DateTime.MinValue && speedHist != null && speedHist.TryGetValue(session, out hl) && hl.Count > 0)
+            {
+                last = hl[hl.Count - 1].Utc;
+            }
+            return last;
+        }
+
+        // Speed of one session: if there is usage in the current window it is the current speed; if not (it went idle / its cache expired), compute a gray "average speed while it was active":
+        // the window length is still speedMin but ends at its last activity. Only computed for rows the Session view will draw / sort; results are cached in speedBy
+        private SpeedInfo SpeedFor(string session)
+        {
+            if (speedBy == null)
+            {
+                return null;
+            }
+            SpeedInfo si;
+            if (!speedBy.TryGetValue(session, out si))
+            {
+                si = new SpeedInfo();
+                speedBy[session] = si;
+            }
+            if (!si.GrayDone && !(si.Known && (si.R5 > 0 || si.Rw > 0)))
+            {
+                si.GrayDone = true;
+                UsageTracker.LiveInfo li;
+                usageSnap.Live.TryGetValue(session, out li);
+                DateTime last = LastActivity(session, li);
+                if (last > DateTime.MinValue)
+                {
+                    double p5, pw;
+                    if (SumPct(session, li, last.AddMinutes(-speedMin), last, out p5, out pw))
+                    {
+                        double hours = speedMin / 60.0;
+                        si.HasGray = true;
+                        si.G5 = p5 / hours;
+                        si.Gw = pw / hours;
+                        si.GP5 = p5;
+                        si.GPw = pw;
+                    }
+                }
+            }
+            return si;
+        }
+
+        // Read the last 8 days of messages from the log (in the background, low priority, at most once every 5 minutes, only while the Session view is open)
+        private void StartSpeedHistory()
+        {
+            if (!Has(Feat.History) || speedHistBusy || (speedHist != null && DateTime.UtcNow - speedHistUtc < TimeSpan.FromMinutes(Cad().HistMin)))
+            {
+                return;
+            }
+            speedHistBusy = true;
+            speedHistUtc = DateTime.UtcNow;
+            string detail = logger.DetailPath;
+            bool wantLife = false;          // The cost column has been replaced by "Share", so the full history of every session no longer needs to be read
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, List<UsageTracker.RecentUse>> res = null;
+                Dictionary<string, Dictionary<string, long[]>> life = null;
+                ThreadPriority old = Thread.CurrentThread.Priority;
+                try
+                {
+                    Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                    SpeedHistory.Result rr = SpeedHistory.ReadAll(detail, DateTime.Now.AddDays(-8), wantLife);
+                    res = rr.Recent;
+                    life = wantLife ? rr.Life : null;
+                }
+                catch (Exception)
+                {
+                }
+                finally
+                {
+                    try
+                    {
+                        Thread.CurrentThread.Priority = old;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (res != null)
+                        {
+                            speedHist = res;
+                        }
+                        if (life != null)
+                        {
+                            sessionLife = life;
+                        }
+                        speedHistBusy = false;
+                        Redraw();
+                    }));
+                }
+                catch (Exception)
+                {
+                    speedHistBusy = false;
+                }
+            });
+        }
+
+        private static string SpeedSpan(int mins)
+        {
+            return mins < 60 ? mins + " min" : mins % 60 == 0 ? (mins / 60) + " h" : (mins / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " h";
+        }
+
+        private static string SpeedLabel(int mins)
+        {
+            return mins < 60 ? mins + "m" : mins % 60 == 0 ? (mins / 60) + "h" : (mins / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + "h";
+        }
+
+        private static bool Finite(double v)
+        {
+            return !double.IsNaN(v) && !double.IsInfinity(v);
+        }
+
+        private static string RateText(double v, bool week)
+        {
+            if (!Finite(v))
+            {
+                return "—";
+            }
+            return v >= 10 ? v.ToString("0", CultureInfo.InvariantCulture)
+                : v >= 1 || (week && v >= 0.1) ? v.ToString(week ? "0.00" : "0.0", CultureInfo.InvariantCulture) : v.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private string SpeedText(bool known, double r5, double rw)
+        {
+            return !known || (r5 <= 0 && rw <= 0) ? "—" : (quota != null && quota.PlanDerived ? "≈" : "") + RateText(r5, false) + " / " + RateText(rw, true);
+        }
+
+        // At the speed of the last speedMin minutes: how long the 5-hour / weekly quota will last and whether it will hit the cap before the reset
+        private string SpeedForecast(double r5, double rw, bool known, out bool risk)
+        {
+            risk = false;
+            if (data == null)
+            {
+                return "";
+            }
+            if (!known)
+            {
+                return quota == null || quota.Stale ? "Cap forecast: no quota conversion for this account yet, so speed cannot be computed (see the Plan view)"
+                    : "Cap forecast: no usage in the last " + SpeedSpan(speedMin) + "";
+            }
+            DateTime now = DateTime.Now;
+            return "Speed, last " + SpeedSpan(speedMin) + (quota != null && quota.PlanDerived ? " (≈ plan-derived, may be off)" : speedApprox ? " (≈ estimate)" : "") + " · " + LimitText("5h", data.FiveHour, r5, now, ref risk) + " · " + LimitText("Week", data.SevenDay, rw, now, ref risk);
+        }
+
+        private static string LimitText(string name, Quota q, double ratePerHour, DateTime now, ref bool risk)
+        {
+            if (q == null)
+            {
+                return name + " —";
+            }
+            double left = 100 - q.Percent;
+            if (left <= 0)
+            {
+                risk = true;
+                return name + " full";
+            }
+            if (ratePerHour <= 0.001)
+            {
+                return name + " no usage";
+            }
+            double hrs = left / ratePerHour;
+            string t = name + " cap in ~" + HoursText(hrs) + "";
+            if (q.ResetsAt.HasValue)
+            {
+                double toReset = (q.ResetsAt.Value - now).TotalHours;
+                if (toReset > 0)
+                {
+                    if (hrs < toReset)
+                    {
+                        risk = true;
+                        t += " (before reset by " + HoursText(toReset - hrs) + ")";
+                    }
+                    else
+                    {
+                        t += " (after reset)";
+                    }
+                }
+            }
+            return t;
+        }
+
+        // Click the "Speed" header: choose the statistics window
+        private void ShowSpeedMenu(RectangleF at)
+        {
+            ContextMenuStrip m = new ContextMenuStrip();
+            FillSpeedItems(m.Items);
+            m.Closed += delegate { BeginInvoke(new MethodInvoker(delegate { m.Dispose(); })); };
+            m.Show(this, new Point((int)at.X, (int)at.Bottom + 2));
+        }
+
+        private void SetSpeedWindow(int mins)
+        {
+            speedMin = Math.Max(1, Math.Min(2880, mins));
+            foreach (SpeedInfo si in speedBy != null ? new List<SpeedInfo>(speedBy.Values) : new List<SpeedInfo>())
+            {
+                si.GrayDone = false;
+            }
+            Redraw();
+            SaveSettings();
         }
 
         // How active a session is: 0 = being written (activity in the last 60 seconds), 1 = cache not expired yet, 2 = expired or no cache.
@@ -4264,7 +5619,7 @@ namespace Stilla
             UsageTracker.LiveInfo li;
             if (usageSnap.Live.TryGetValue(session, out li))
             {
-                active = active || li.Active;
+                active = active || li.Active || li.Waiting;
                 if (!expiry.HasValue)
                 {
                     expiry = li.ExpiryUtc;
@@ -4339,15 +5694,8 @@ namespace Stilla
             public long Total, CacheRead;
         }
 
-        private sealed class ModelLine
-        {
-            public ModelGroup Group;
-            public UsageTracker.ModelTotal Part;     // null = a session row (group row), otherwise an expanded sub-row
-            public bool Expanded;
-        }
-
-        // Flatten into the rows to show: group rows + (expanded) sub-rows. Session order is the same as in the session view: those in use on top, those with an unexpired cache next, expired ones below
-        private List<ModelLine> BuildModelLines(UsageTracker.PeriodSummary cur)
+        // Session order is the same as in the Session view: active ones on top, then those with an unexpired cache, then expired ones
+        private List<ModelGroup> BuildModelGroups(UsageTracker.PeriodSummary cur)
         {
             Dictionary<string, ModelGroup> map = new Dictionary<string, ModelGroup>();
             List<ModelGroup> groups = new List<ModelGroup>();
@@ -4382,25 +5730,16 @@ namespace Stilla
                 keys.Add(k);
             }
             keys.Sort(CompareKeys);
-            List<ModelLine> lines = new List<ModelLine>();
+            List<ModelGroup> sorted = new List<ModelGroup>(keys.Count);
             foreach (RowKey k in keys)
             {
-                ModelLine head = new ModelLine();
-                head.Group = k.Group;
-                head.Expanded = k.Group.Parts.Count > 1 && expandedGroups.Contains(k.Group.Session);
-                lines.Add(head);
-                if (head.Expanded)
-                {
-                    foreach (UsageTracker.ModelTotal p in k.Group.Parts)
-                    {
-                        ModelLine child = new ModelLine();
-                        child.Group = k.Group;
-                        child.Part = p;
-                        lines.Add(child);
-                    }
-                }
+                sorted.Add(k.Group);
             }
-            return lines;
+            if (sortCol[1] >= 0)
+            {
+                ApplyGroupSort(sorted);
+            }
+            return sorted;
         }
 
         // How to show too many rows: not expanded -> first cap-1 rows + "k more"; expanded -> as many rows as fit (one row is kept for "collapse"), the rest are scrolled with the wheel
@@ -4440,7 +5779,7 @@ namespace Stilla
         private void DrawMoreRow(Graphics g, string text, string[] nums, float pad, float inner, float s, float colW, float nameW, float y, float rowH)
         {
             moreRect = new RectangleF(pad, y, inner, rowH);
-            DrawTextRect(g, text, fSmall, Accent, new RectangleF(pad + 4f * s, y, nameW - 4f * s, rowH), StringAlignment.Near);
+            DrawTextFit(g, text, fSmall, Accent, new RectangleF(pad + 4f * s, y, nameW - 4f * s, rowH), StringAlignment.Near);
             if (nums != null)
             {
                 DrawRowNumbers(g, pad, inner, colW, y, rowH, nums, TextDim);
@@ -4451,7 +5790,8 @@ namespace Stilla
         private int RowCountNow()
         {
             UsageTracker.PeriodSummary cur = PeriodFor(usagePeriod);
-            return usageMode == 1 ? BuildModelLines(cur).Count : usageMode == 4 ? AccountStore.Accounts.Count : cur.Rows.Count;
+            return usageMode == 1 ? BuildModelGroups(cur).Count : usageMode == 2 ? BuildTierItems(cur).Count : usageMode == 3 ? AccountStore.Accounts.Count
+                : usageMode == 4 ? (apiRows == null ? 1 : apiRows.Count) : cur.Rows.Count;
         }
 
         // Expand: the window grows exactly tall enough for all rows (up to the screen's usable height, the rest is scrolled with the wheel); click again to collapse and the window returns to its previous height
@@ -4465,7 +5805,7 @@ namespace Stilla
             rowsExpanded = true;
             rowScroll = 0;
             savedWinHu = winHu;
-            int need = CompactH() + 146 + (RowCountNow() + 1) * 16 + 40;
+            int need = CompactH() + 154 + (RowCountNow() + 3) * rowHu;
             Rectangle wa = Screen.FromControl(this).WorkingArea;
             int target = Math.Min(need, (int)Math.Floor((wa.Height - 16) / scale));
             if (target > CurH())
@@ -4519,7 +5859,9 @@ namespace Stilla
         // Time tabs: drawn by the current skin; only the checked tabs are drawn, with equal width; the font shrinks automatically when there are too many to fit
         private void DrawTabStrip(Graphics g, List<int> shown, float pad, float y0, float inner, float s)
         {
-            float cell = inner / shown.Count;
+            float moreW = 22f * s;                  // The right end of the tab strip is reserved for the "..." extension button
+            tabMoreRect = RectangleF.Empty;
+            float cell = (inner - moreW) / shown.Count;
             float widest = 0;
             foreach (int i in shown)
             {
@@ -4550,30 +5892,51 @@ namespace Stilla
                 };
                 skin.DrawTab(g, rect, t, f, curPal, s);
             }
+            DrawTabMore(g, pad + inner - moreW, y0, moreW, s);
         }
+
+        private float modeSwitchX;      // left edge of the view buttons in the last frame (the pause note sits to the left of it)
 
         // The four view buttons on the right of the header: session / model / compare / tier (a click switches directly)
         private void DrawModeSwitch(Graphics g, int w, float pad, float y, float s)
         {
-            string[] names = { "Session", "Model", "Compare", "Tier", "Plan" };
-            float segW = 58f * s, segH = 18f * s;
-            float x0 = w - pad - segW * names.Length;
-            for (int i = 0; i < names.Length; i++)
+            string[] all = Feat.VNames;
+            List<string> names = new List<string>();
+            List<int> ids = new List<int>();
+            for (int i = 0; i < all.Length; i++)
             {
-                segRects[i] = new RectangleF(x0 + segW * i, y, segW, segH);
+                segRects[i] = RectangleF.Empty;
+                if ((vmask & (1 << i)) != 0)
+                {
+                    names.Add(all[i]);
+                    ids.Add(i);
+                }
             }
-            skin.DrawModes(g, segRects, names, usageMode, FontsNow(), curPal, s);
+            float segW = 58f * s, segH = 18f * s;
+            float x0 = w - pad - segW * names.Count;
+            modeSwitchX = x0;
+            RectangleF[] vis = new RectangleF[names.Count];
+            for (int k = 0; k < names.Count; k++)
+            {
+                vis[k] = new RectangleF(x0 + segW * k, y, segW, segH);
+                segRects[ids[k]] = vis[k];
+            }
+            skin.DrawModes(g, vis, names.ToArray(), ids.IndexOf(usageMode), FontsNow(), curPal, s);
         }
 
-        // One row per session: a green dot if it is active; name; remaining cache time; the four usage numbers
+        // One session per row: status dot (colors below); name; cache left / state; four usage figures
         private void DrawSessionRow(Graphics g, UsageTracker.SessionTotal t, float pad, float inner, float s, float colW, float cacheW, float nameW, float y, float rowH)
         {
+            UsageTracker.LiveInfo li;
+            usageSnap.Live.TryGetValue(t.Session, out li);
+            double remMin;
+            CacheState st = StateOf(li, t.Active, t.CacheExpiryUtc, DateTime.UtcNow, out remMin);
             Color c = t.Active ? TextMain : TextDim;
-            if (t.Active)
+            if (st != CacheState.None)
             {
-                using (SolidBrush gb = new SolidBrush(Green))
+                using (SolidBrush gb = new SolidBrush(StateColor(st)))
                 {
-                    g.FillEllipse(gb, pad, y + 5f * s, 6f * s, 6f * s);
+                    g.FillEllipse(gb, pad, y + (rowH - 6f * s) / 2f, 6f * s, 6f * s);
                 }
             }
 
@@ -4583,33 +5946,312 @@ namespace Stilla
             {
                 name += " +" + t.SubCount + " sub";
             }
-            DrawTextRect(g, name, fSmall, c, new RectangleF(pad + 12f * s, y, nameW - 12f * s, rowH), StringAlignment.Near);
-
-            // Cache remaining: time of the main session's last cache read/write + cache lifetime; a countdown while it has not expired
-            string cacheText;
-            Color cacheColor;
-            if (t.CacheExpiryUtc.HasValue)
+            bool jumpOn = Show(Feat.Jump);
+            bool watched = MailStore.Enabled && MailStore.Find(t.Session) != null;      // Sessions with email reminders ticked get an @ after the name
+            float rightPad = (jumpOn ? 16f * s : 0f) + (watched ? 11f * s : 0f);
+            DrawTextRect(g, name, fSmall, c, new RectangleF(pad + 12f * s, y, Math.Max(10f * s, nameW - 12f * s - rightPad), rowH), StringAlignment.Near);
+            if (watched)
             {
-                TimeSpan rem = t.CacheExpiryUtc.Value - DateTime.UtcNow;
-                if (rem > TimeSpan.Zero)
-                {
-                    cacheText = FormatRemain(rem);
-                    cacheColor = Green;
-                }
-                else
-                {
-                    cacheText = "Expired";
-                    cacheColor = TextDim;
-                }
+                DrawTextRect(g, "@", fSmall, Accent, new RectangleF(pad + nameW - rightPad - 4f * s, y, 19f * s, rowH), StringAlignment.Center);
+            }
+            if (jumpOn)
+            {
+                // The ↗ to the right of the name: click it to jump to the window of this session
+                RectangleF jr = new RectangleF(pad + nameW - 16f * s, y, 16f * s, rowH);
+                DrawJumpIcon(g, jr, s);
+                jumpHits.Add(new KeyValuePair<RectangleF, UsageTracker.SessionTotal>(jr, t));
+            }
+
+            // Cache left: Running (green) / Waiting (blue, followed by the cache countdown) / countdown: 30-60 min white, 10-30 yellow, 0-10 red; when it runs out it shows "Expired"
+            string cacheText;
+            Color cacheColor = StateColor(st);
+            if (st == CacheState.Running)
+            {
+                cacheText = "Running";
+            }
+            else if (st == CacheState.Waiting)
+            {
+                cacheText = remMin > 0 ? "Waiting " + FormatRemain(TimeSpan.FromMinutes(remMin)) : "Waiting";
+            }
+            else if (st != CacheState.None)
+            {
+                cacheText = FormatRemain(TimeSpan.FromMinutes(remMin));
+            }
+            else if (t.CacheExpiryUtc.HasValue || (li != null && li.ExpiryUtc.HasValue))
+            {
+                cacheText = "Expired";
             }
             else
             {
                 cacheText = "No cache";
-                cacheColor = TextDim;
             }
-            DrawTextRect(g, cacheText, fSmall, cacheColor, new RectangleF(pad + nameW, y, cacheW, rowH), StringAlignment.Far);
+            if (cacheW >= 1f)
+            {
+                DrawTextFit(g, cacheText, fSmall, cacheColor, new RectangleF(pad + nameW, y, cacheW, rowH), StringAlignment.Far);
+            }
 
+            // Speed: normal color if there is burn in the current window; otherwise (idle / cache expired) the gray "average speed while it was active"; neither = a dash
+            if (colWidth[2] >= 1f)
+            {
+                SpeedInfo si = SpeedFor(t.Session);
+                bool curSpeed = si != null && si.Known && (si.R5 > 0 || si.Rw > 0);
+                bool graySpeed = !curSpeed && si != null && si.HasGray && (si.G5 > 0 || si.Gw > 0);
+                DrawTextFit(g, curSpeed ? SpeedText(true, si.R5, si.Rw) : graySpeed ? SpeedText(true, si.G5, si.Gw) : "—", fSmall, curSpeed ? TextMain : TextDim,
+                    new RectangleF(pad + nameW + cacheW, y, colWidth[2], rowH), StringAlignment.Far);
+            }
+
+            if (colWidth[3] >= 1f)
+            {
+                DrawOccCell(g, t, pad + nameW + cacheW + colWidth[2], y, colWidth[3], rowH, c);       // Share: the 5h / weekly quota used in the same statistics window
+            }
             DrawRowNumbers(g, pad, inner, colW, y, rowH, Numbers(t.Input, t.Output, t.CacheWrite, t.CacheRead), c);
+        }
+
+        // ---------------------------------------------------------------- cache reminders
+        // After Claude's prompt cache expires (lifetime 5 minutes or 1 hour, depending on which one the session's latest cache write used), the next message has to write the whole context into the cache again,
+        // which costs dozens of times more than continuing (reading the cache). So each session gets a status color, and a system notification pops up shortly before expiry so you can still send a message and keep the cache alive.
+        //   green = running (Claude Code reports busy, or there was a new record in the last 60 seconds; the cache renews itself with each request)
+        //   blue = waiting for you (Claude Code reports waiting: a permission / question / plan-approval dialog). Not finished, not running; it is stuck and the cache keeps counting down
+        //   red = 0-10 minutes left (a system notification pops up)  yellow = 10-30  white = 30-60 (normal color)  gray = expired / no cache
+        private enum CacheState { None = 0, Fresh = 1, Running = 2, Soon = 3, Waiting = 4, Urgent = 5 }   // The bigger the number, the more urgent (the overview takes the largest)
+
+        private const long AlertMinCtx = 50000;     // Sessions whose context is smaller than this get no notification when the cache expires; it costs little
+
+        private CacheState StateOf(UsageTracker.LiveInfo li, bool activeHint, DateTime? expiryHint, DateTime nowUtc, out double remMin)
+        {
+            remMin = 0;
+            DateTime? exp = expiryHint.HasValue ? expiryHint : (li != null ? li.ExpiryUtc : null);
+            double rem = exp.HasValue ? (exp.Value - nowUtc).TotalMinutes : 0;
+            if (li != null && li.Waiting)
+            {
+                remMin = Math.Max(0, rem);      // While waiting for you, the cache keeps counting down: blue, but the time left is still shown
+                return CacheState.Waiting;
+            }
+            if (activeHint || (li != null && li.Active))
+            {
+                return CacheState.Running;
+            }
+            if (!exp.HasValue || rem <= 0)
+            {
+                return CacheState.None;
+            }
+            remMin = rem;
+            return rem <= 10 ? CacheState.Urgent : rem <= 30 ? CacheState.Soon : CacheState.Fresh;
+        }
+
+        private CacheState StateOf(UsageTracker.LiveInfo li, DateTime nowUtc, out double remMin)
+        {
+            return StateOf(li, false, null, nowUtc, out remMin);
+        }
+
+        // Status colors are fixed red / yellow / green / blue (they do not follow the skin: the skins' green / yellow / red were turned into black, white and orange); only the shade is adjusted for light / dark themes; white = normal text color
+        private Color StateColor(CacheState st)
+        {
+            switch (st)
+            {
+                case CacheState.Urgent: return inverted ? Color.FromArgb(248, 113, 113) : Color.FromArgb(220, 38, 38);
+                case CacheState.Soon: return inverted ? Color.FromArgb(250, 204, 21) : Color.FromArgb(202, 138, 4);
+                case CacheState.Running: return inverted ? Color.FromArgb(74, 222, 128) : Color.FromArgb(22, 163, 74);
+                case CacheState.Waiting: return inverted ? Color.FromArgb(96, 165, 250) : Color.FromArgb(37, 99, 235);
+                case CacheState.Fresh: return TextMain;
+                default: return TextDim;
+            }
+        }
+
+        // The most urgent state among all sessions that still have a cache / are running, plus how many are red, yellow, green and blue
+        private CacheState OverallState(out int urgent, out int soon, out int running, out int waiting)
+        {
+            urgent = soon = running = waiting = 0;
+            CacheState best = CacheState.None;
+            DateTime now = DateTime.UtcNow;
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                double rem;
+                CacheState st = StateOf(kv.Value, now, out rem);
+                if (st == CacheState.Urgent) urgent++;
+                else if (st == CacheState.Soon) soon++;
+                else if (st == CacheState.Running) running++;
+                else if (st == CacheState.Waiting) waiting++;
+                if (st > best)
+                {
+                    best = st;
+                }
+            }
+            return best;
+        }
+
+        private string LiveTitle(string session)
+        {
+            foreach (UsageTracker.PeriodSummary p in usageSnap.Periods)
+            {
+                foreach (UsageTracker.SessionTotal t in p.Rows)
+                {
+                    if (t.Session == session)
+                    {
+                        return t.Title ?? (t.Name + " · " + t.ShortId);
+                    }
+                }
+            }
+            return SessionNames.Get(session) ?? session.Substring(0, Math.Min(6, session.Length));
+        }
+
+        // Extra cost of reloading after expiry: context x cache write price; continuing only costs the cache read price. Only computed when a model price table exists
+        private string ReloadCostText(UsageTracker.LiveInfo li)
+        {
+            QuotaTable.Entry e;
+            if (quota == null || string.IsNullOrEmpty(li.Model) || li.Ctx <= 0 || !quota.Models.TryGetValue(BaseModel(li.Model), out e))
+            {
+                return "";
+            }
+            double write = (li.TtlMin >= 60 ? e.Price[3] : e.Price[2]) * li.Ctx / 1000000.0;
+            double read = e.Price[4] * li.Ctx / 1000000.0;
+            string text = ", reload after expiry ~" + UsdText(write) + " (continue now: ~" + UsdText(read) + ")";
+            if (!quota.Stale && e.K5 > 0)
+            {
+                text += " ≈" + (write * e.K5).ToString("0.0", CultureInfo.InvariantCulture) + "% of the 5-hour quota for a reload";
+            }
+            return text;
+        }
+
+        // Which sessions to remind about: the cache time left has just dropped from above 10 minutes to within 10 minutes (we have to see the "drop" itself, so sessions that are already red at startup are not reminded),
+        // lifetime >= 30 minutes (a 5-minute-lifetime session turns red after every reply and would ring all day), context large enough, not running. Also updates each session's previous remaining time
+        private List<string> CollectCacheAlerts(DateTime now)
+        {
+            List<string> hit = new List<string>();
+            foreach (KeyValuePair<string, UsageTracker.LiveInfo> kv in usageSnap.Live)
+            {
+                double rem;
+                CacheState st = StateOf(kv.Value, now, out rem);
+                double prev;
+                bool had = cacheRem.TryGetValue(kv.Key, out prev);
+                bool counting = st == CacheState.Urgent || st == CacheState.Soon || st == CacheState.Fresh || (st == CacheState.Waiting && rem > 0);
+                cacheRem[kv.Key] = counting ? rem : 99;
+                if (alertsOn && !paused && had && prev > alertMin && counting && rem <= alertMin && kv.Value.TtlMin >= 30 && kv.Value.Ctx >= AlertMinCtx)
+                {
+                    hit.Add(kv.Key);
+                }
+            }
+            return hit;
+        }
+
+        // Notification text: at most 3 sessions (title, minutes left, context size, extra cost of reloading); more are summed up as "N more"
+        private string BuildAlertText(List<string> hit, DateTime now, out string title)
+        {
+            LoadQuota();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < hit.Count && i < 3; i++)
+            {
+                UsageTracker.LiveInfo li = usageSnap.Live[hit[i]];
+                double rem;
+                StateOf(li, now, out rem);
+                string name = LiveTitle(hit[i]);
+                if (name.Length > 16)
+                {
+                    name = name.Substring(0, 16) + "…";
+                }
+                sb.Append("\"").Append(name).Append("\": ").Append(Math.Max(1, (int)Math.Round(rem))).Append(" min left, context ")
+                    .Append(UsageTracker.FormatTokens(li.Ctx)).Append(ReloadCostText(li)).Append(li.Waiting ? " (waiting for you)" : "").Append('\n');
+            }
+            if (hit.Count > 3)
+            {
+                sb.Append("... and ").Append(hit.Count - 3).Append(hit.Count - 3 == 1 ? " more session" : " more sessions");
+            }
+            title = "Claude cache expires within " + alertMin + " min" + (hit.Count > 1 ? " (" + hit.Count + " sessions)" : "");
+            string text = sb.ToString().TrimEnd('\n');
+            return text.Length > 250 ? text.Substring(0, 250) : text;
+        }
+
+        // Checked on every tick: pop up system notifications where due; then update the tray icon's status dot, the tray tooltip and the status dots on the cards
+        private void UpdateCacheIndicators()
+        {
+            DateTime now = DateTime.UtcNow;
+            List<string> hit = CollectCacheAlerts(now);
+            try
+            {
+                CheckMailAlerts(now);
+            }
+            catch (Exception)
+            {
+            }
+            if (hit.Count > 0)
+            {
+                string title;
+                string text = BuildAlertText(hit, now, out title);
+                Balloon(title, text);
+            }
+
+            int urgent, soon, running, waiting;
+            CacheState overall = OverallState(out urgent, out soon, out running, out waiting);
+            int key = ((((urgent * 100 + soon) * 100 + running) * 100 + waiting) * 10) + (int)overall;
+            if (key != indicatorKey)
+            {
+                indicatorKey = key;
+                indicatorState = overall;
+                cUrgent = urgent;
+                cSoon = soon;
+                cRunning = running;
+                cWaiting = waiting;
+                UpdateTrayDot(overall);
+                UpdateTrayText();
+                Redraw();
+            }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr handle);
+
+        // The status dot at the bottom right of the tray icon (color = the most urgent state among all sessions); with no session to remind about it is the original icon
+        private void UpdateTrayDot(CacheState st)
+        {
+            if (tray == null || (int)st == trayDotKey)
+            {
+                return;
+            }
+            trayDotKey = (int)st;
+            try
+            {
+                Icon baseIcon = Icon ?? SystemIcons.Application;
+                using (Bitmap bmp = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    using (Bitmap src = baseIcon.ToBitmap())
+                    {
+                        g.DrawImage(src, 0, 0, 32, 32);
+                    }
+                    if (st != CacheState.None)
+                    {
+                        Color c = StateColor(st);
+                        using (SolidBrush ring = new SolidBrush(Color.FromArgb(50, 50, 50)))
+                        using (SolidBrush dot = new SolidBrush(Color.FromArgb(255, c)))
+                        {
+                            g.FillEllipse(ring, 14, 14, 18, 18);
+                            g.FillEllipse(dot, 16, 16, 14, 14);
+                        }
+                    }
+                    IntPtr h = bmp.GetHicon();
+                    tray.Icon = Icon.FromHandle(h);
+                    if (trayDotHandle != IntPtr.Zero)
+                    {
+                        DestroyIcon(trayDotHandle);
+                    }
+                    trayDotHandle = h;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private string CountText()
+        {
+            List<string> parts = new List<string>();
+            if (cUrgent > 0) parts.Add("red " + cUrgent);
+            if (cSoon > 0) parts.Add("yellow " + cSoon);
+            if (cRunning > 0) parts.Add("green " + cRunning);
+            if (cWaiting > 0) parts.Add("blue " + cWaiting);
+            return string.Join(" ", parts.ToArray());
         }
 
         // Remaining time: m:ss when under 1 hour, h:mm:ss otherwise
@@ -4636,8 +6278,27 @@ namespace Stilla
         // The four columns on the right are right-aligned
         private void DrawRowNumbers(Graphics g, float pad, float inner, float colW, float y, float h, string[] texts, Color color)
         {
-            float x = pad + colWidth[0] + colWidth[1];
+            int first = usageMode == 0 ? 4 : 3;        // Session view: column 3 is "Share", the number columns start at column 4
+            float x = pad;
+            for (int c = 0; c < first; c++)
+            {
+                x += colWidth[c];
+            }
             for (int k = 0; k < 4; k++)
+            {
+                if (colWidth[first + k] >= 1f)
+                {
+                    DrawTextFit(g, texts[k], fSmall, color, new RectangleF(x, y, colWidth[first + k], h), StringAlignment.Far);
+                }
+                x += colWidth[first + k];
+            }
+        }
+
+        // 5 number columns (Compare view): occupy columns 2-6
+        private void DrawRowNumbers5(Graphics g, float pad, float inner, float colW, float y, float h, string[] texts, Color color)
+        {
+            float x = pad + colWidth[0] + colWidth[1];
+            for (int k = 0; k < 5; k++)
             {
                 DrawTextFit(g, texts[k], fSmall, color, new RectangleF(x, y, colWidth[2 + k], h), StringAlignment.Far);
                 x += colWidth[2 + k];
@@ -4647,6 +6308,10 @@ namespace Stilla
         // Run scripts\sync_vscode_titles.py to export the session titles from VS Code. Runs on a background thread, waits at most 60 seconds, never blocks the UI
         private void StartVsCodeSync()
         {
+            if (ClaudeRoots.Isolated)
+            {
+                return;         // Demo / isolated mode: do not read the real VS Code databases
+            }
             string dir = AppPaths.DataDir;
             string script = AppPaths.Script("sync_vscode_titles.py");
             if (!File.Exists(script))
@@ -4758,20 +6423,29 @@ namespace Stilla
         {
             accountRect = RectangleF.Empty;
             string chip = AccountChipText();
-            if (chip.Length == 0 || !skin.ShowAccountChip)
+            if (chip.Length == 0 || !skin.ShowAccountChip || !Show(Feat.Chip))
             {
                 return;
             }
-            float cw = MeasureW(g, chip) + 14f * s;
+            bool dot = indicatorState != CacheState.None;           // Cache status dot: the color of the most urgent state among all sessions
+            float dotW = dot ? 10f * s : 0f;
+            float cw = MeasureW(g, chip) + 14f * s + dotW;
             if (refreshRect.X - cw - 2f * s < pad + 100f * s && AccountStore.Current != null)
             {
                 chip = AccountStore.Current.Id;     // Too narrow: keep only the ID
-                cw = MeasureW(g, chip) + 14f * s;
+                cw = MeasureW(g, chip) + 14f * s + dotW;
             }
             RectangleF r = new RectangleF(refreshRect.X - cw - 2f * s, 8f * s, cw, 18f * s);
             Color c = AccountStore.Current == null ? Amber : TextDim;
             SkinDraw.RrLine(g, c, r, 9f * s, 1f * s);
-            DrawTextRect(g, chip, fSmall, c, r, StringAlignment.Center);
+            if (dot)
+            {
+                using (SolidBrush db = new SolidBrush(StateColor(indicatorState)))
+                {
+                    g.FillEllipse(db, r.X + 7f * s, r.Y + r.Height / 2f - 3f * s, 6f * s, 6f * s);
+                }
+            }
+            DrawTextRect(g, chip, fSmall, c, new RectangleF(r.X + dotW, r.Y, r.Width - dotW, r.Height), StringAlignment.Center);
             accountRect = r;
         }
 
@@ -4884,7 +6558,7 @@ namespace Stilla
                 }
             }
             Account before = AccountStore.Current;
-            if (AccountStore.SetCurrent(a.Id, a.Plan, "auto-detected"))
+            if (AccountStore.SetCurrent(a.Id, a.Plan, "auto-detected", Path.Combine(AppPaths.DataDir, "quota_snapshots.csv")))
             {
                 if (before != null && before.Id != a.Id)
                 {
@@ -5025,7 +6699,18 @@ namespace Stilla
                 items.Add(none);
             }
             items.Add(new ToolStripSeparator());
-            items.Add("Subscription view", null, delegate
+            items.Add("Plan view", null, delegate
+            {
+                if (!showUsage)
+                {
+                    SetUsageVisible(true);
+                }
+                CollapseRows();
+                usageMode = 3;
+                Redraw();
+                SaveSettings();
+            });
+            items.Add("API view", null, delegate
             {
                 if (!showUsage)
                 {
@@ -5245,7 +6930,7 @@ namespace Stilla
                 Account a = items[i];
                 float ry = y + i * rowH;
                 double? cost = SubCost(a.Id);
-                skin.DrawShare(g, pad + 10f * s, ry + 2.5f * s, total > 0 && cost.HasValue ? Math.Min(1.0, cost.Value / total) : 0, curPal, s);
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, total > 0 && cost.HasValue ? Math.Min(1.0, cost.Value / total) : 0, curPal, s);
                 float nameX = pad + (skin.ShareWidth + 17f) * s;
                 float right = pad + nameW - 6f * s;
                 float x = a == cur ? DrawTierBadge(g, "Current", 4, right, ry, rowH, s) : right;
@@ -5270,10 +6955,140 @@ namespace Stilla
             return shown;
         }
 
+        // ---------------------------------------------------------------- API view
+        // Only counts "non-Claude models called through an API" (DeepSeek etc. in the local log); Claude subscription usage is not here. Reads the log once in the background, at most every 10 minutes
+        private void StartApiRefresh()
+        {
+            if (apiBusy || (apiRows != null && DateTime.UtcNow - apiRefreshUtc < TimeSpan.FromMinutes(10)))
+            {
+                return;
+            }
+            apiBusy = true;
+            apiRefreshUtc = DateTime.UtcNow;
+            string detail = logger.DetailPath;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<LogSummary.ApiTotal> res = null;
+                try
+                {
+                    res = LogSummary.ReadApiTotals(detail);
+                }
+                catch (Exception)
+                {
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (res != null)
+                        {
+                            apiRows = res;
+                        }
+                        apiBusy = false;
+                        Redraw();
+                    }));
+                }
+                catch (Exception)
+                {
+                    apiBusy = false;
+                }
+            });
+        }
+
+        // Estimated cost (CNY): only DeepSeek has a price for now (off-peak price, see EstimateCostCny); models without a price give NaN
+        private static double ApiCostCny(LogSummary.ApiTotal a)
+        {
+            return a.Model.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase) ? EstimateCostCny(a.In, a.Out, a.Cw, a.Cr) : double.NaN;
+        }
+
+        private static string CnyText(double v)
+        {
+            return double.IsNaN(v) ? "—" : "¥" + v.ToString(v < 100 ? "0.00" : "0", CultureInfo.InvariantCulture);
+        }
+
+        private int DrawApiRows(Graphics g, float pad, float inner, float s, float colW, float nameW, float y, float rowH, int cap)
+        {
+            if (apiRows == null)
+            {
+                DrawTextRect(g, "Counting API usage in the log...", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return 1;
+            }
+            if (apiRows.Count == 0)
+            {
+                DrawTextRect(g, "No usage of non-Claude models called through an API in the log", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return 1;
+            }
+            double total = 0;
+            foreach (LogSummary.ApiTotal a in apiRows)
+            {
+                double c = ApiCostCny(a);
+                total += double.IsNaN(c) ? 0 : c;
+            }
+            int shown = Math.Min(apiRows.Count, cap);
+            for (int i = 0; i < shown; i++)
+            {
+                LogSummary.ApiTotal a = apiRows[i];
+                float ry = y + i * rowH;
+                double cost = ApiCostCny(a);
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, total > 0 && !double.IsNaN(cost) ? Math.Min(1.0, cost / total) : 0, curPal, s);
+                float nameX = pad + (skin.ShareWidth + 17f) * s;
+                string span = a.First.ToString("MM-dd", CultureInfo.InvariantCulture) + "~" + a.Last.ToString("MM-dd", CultureInfo.InvariantCulture);
+                float sw = MeasureW(g, span) + 12f * s;
+                float right = pad + nameW - 6f * s;
+                DrawTextRect(g, span, fSmall, TextDim, new RectangleF(right - sw, ry, sw, rowH), StringAlignment.Far);
+                DrawTextFit(g, a.Model, fSmall, TextMain, new RectangleF(nameX, ry, Math.Max(24f * s, right - sw - 4f * s - nameX), rowH), StringAlignment.Near);
+                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+                {
+                    a.Msgs.ToString("N0", CultureInfo.InvariantCulture), UsageTracker.FormatTokens(a.In + a.Cw), UsageTracker.FormatTokens(a.Out), CnyText(cost)
+                }, TextMain);
+            }
+            return shown;
+        }
+
+        private void DrawApiInfo(Graphics g, float pad, float inner, float s, float y, float rowH)
+        {
+            tipInfoY = y;
+            tipInfoN = apiRows == null || apiRows.Count == 0 ? 0 : 3;
+            if (apiRows == null || apiRows.Count == 0)
+            {
+                DrawTextFit(g, "Claude plan usage: see the Plan view. Anthropic Console API usage needs an Admin Key (not available).", fSmall, TextDim,
+                    new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+                return;
+            }
+            long msgs = 0, inp = 0, outp = 0, cr = 0;
+            double total = 0;
+            bool unpriced = false;
+            foreach (LogSummary.ApiTotal a in apiRows)
+            {
+                msgs += a.Msgs;
+                inp += a.In + a.Cw;
+                outp += a.Out;
+                cr += a.Cr;
+                double c = ApiCostCny(a);
+                if (double.IsNaN(c))
+                {
+                    unpriced = true;
+                }
+                else
+                {
+                    total += c;
+                }
+            }
+            DrawTextFit(g, "Total " + msgs.ToString("N0", CultureInfo.InvariantCulture) + " - Input " + UsageTracker.FormatTokens(inp) + " - Output " + UsageTracker.FormatTokens(outp)
+                + " - cache hits " + UsageTracker.FormatTokens(cr), fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, "Est. cost " + CnyText(total) + (unpriced ? " (excl. unpriced models)" : "") + " · DeepSeek off-peak per M tokens: in ¥" + DsMissPerM.ToString("0.##", CultureInfo.InvariantCulture)
+                + ", cache hit ¥" + DsHitPerM.ToString("0.##", CultureInfo.InvariantCulture) + ", out ¥" + DsOutPerM.ToString("0.##", CultureInfo.InvariantCulture) + "",
+                fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, "Non-Claude models only. Anthropic Console API usage needs an Admin Key (not available here).", fSmall, TextDim,
+                new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
+        }
+
         // Bottom of the subscription view: the subscription period of the current account, this period's usage converted, weekly quota forecast
         private void DrawSubscriptionInfo(Graphics g, float pad, float inner, float s, float y, float rowH)
         {
             Account a = AccountStore.Current;
+            tipInfoY = y;
+            tipInfoN = a == null ? 0 : 3;
             if (a == null)
             {
                 DrawTextRect(g, "Right-click → Accounts and subscriptions → Manage... to edit name, plan, fee, start date", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
@@ -5287,7 +7102,7 @@ namespace Stilla
             string l1 = a.Label + " · " + PlanInfo.NameOf(a.Plan) + " · "
                 + (a.Start == DateTime.MinValue ? "Start date unknown" : "since " + a.Start.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + "")
                 + " · cycle " + day + "/" + totalDays + " d" + (cal ? " (calendar month)" : ", " + ce.ToString("MM-dd", CultureInfo.InvariantCulture) + " renewal");
-            DrawTextRect(g, l1, fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l1, fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
 
             double? cost = SubCost(a.Id);
             string l2;
@@ -5301,11 +7116,11 @@ namespace Stilla
                 l2 = "API value " + Money(c) + (a.Fee > 0 ? " (fee " + Money(a.Fee) + ", ×" + (c / a.Fee).ToString(c / a.Fee < 10 ? "0.0" : "0", CultureInfo.InvariantCulture) + ")" : "")
                     + " · daily " + Money(c / day) + " · cycle ≈ " + Money(c / day * totalDays);
             }
-            DrawTextRect(g, l2, fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l2, fSmall, TextMain, new RectangleF(pad, y + rowH, inner, rowH), StringAlignment.Near);
 
             bool risk;
             string l3 = WeeklyForecast(out risk);
-            DrawTextRect(g, l3, fSmall, risk ? Amber : TextDim, new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
+            DrawTextFit(g, l3, fSmall, risk ? Amber : TextDim, new RectangleF(pad, y + 2f * rowH, inner, rowH), StringAlignment.Near);
         }
 
         // Renewal reminder: when the renewal is within 3 days, show one tray notification (once per period). No reminder when the subscription start date is unknown
@@ -5330,7 +7145,7 @@ namespace Stilla
             {
                 renewNotified = id;
                 double? cost = SubCost(a.Id);
-                Balloon("Subscription renewing soon", a.Label + " (" + PlanInfo.NameOf(a.Plan) + ") renews in " + (int)Math.Ceiling(days) + " days (" + ce.ToString("MM-dd", CultureInfo.InvariantCulture) + ")"
+                Balloon("Subscription renewing soon", a.Label + " (" + PlanInfo.NameOf(a.Plan) + ") renews in " + (int)Math.Ceiling(days) + ((int)Math.Ceiling(days) == 1 ? " day (" : " days (") + ce.ToString("MM-dd", CultureInfo.InvariantCulture) + ")"
                     + (a.Fee > 0 ? ", monthly fee " + Money(a.Fee) : "") + (cost.HasValue && a.Fee > 0 ? ". Usage this period is worth " + Money(cost.Value) + " (×" + (cost.Value / a.Fee).ToString("0.0", CultureInfo.InvariantCulture) + ")" : "") + ". ");
             }
         }
@@ -5391,6 +7206,8 @@ namespace Stilla
 
         private void NoteWeekly(FetchResult r)
         {
+            NoteFive(r);
+            CheckLimitWarn(r);
             if (r.SevenDay == null || !r.SevenDay.ResetsAt.HasValue)
             {
                 return;
@@ -5415,6 +7232,10 @@ namespace Stilla
 
         private static string HoursText(double h)
         {
+            if (!Finite(h))
+            {
+                return "—";
+            }
             if (h >= 48)
             {
                 return (h / 24).ToString("0.0", CultureInfo.InvariantCulture) + " d";
@@ -5456,6 +7277,11 @@ namespace Stilla
                 }
             }
             string head = "Week " + pct.ToString("0", CultureInfo.InvariantCulture) + "% (" + HoursText(hoursLeft) + " left)";
+            if (pct >= 99.5)
+            {
+                risk = true;
+                return head + " · used up, recovers after the reset";
+            }
             if (p0 == null || (now - p0.T).TotalHours < 1.5)
             {
                 return head + " · forecast: not enough data yet";
@@ -5528,6 +7354,10 @@ namespace Stilla
 
         private static string FormatPct(double pct, bool approx)
         {
+            if (!Finite(pct))
+            {
+                return "—";
+            }
             // The "≈" prefix takes room, so keep one decimal less
             string num = pct < 10 ? pct.ToString(approx ? "0.0" : "0.00", CultureInfo.InvariantCulture) : pct.ToString("0", CultureInfo.InvariantCulture);
             return (approx ? "≈" : "") + num + "%";
@@ -5641,118 +7471,6 @@ namespace Stilla
             return any && sum > 0 ? FormatPct(sum, approxAny) : "";
         }
 
-        // Quota estimate of each base model in this period (all tiers added up)
-        private void PerModelPct(UsageTracker.PeriodSummary cur, Dictionary<string, double> pct, Dictionary<string, bool> approx)
-        {
-            if (cur.TierRows.Count > 0)
-            {
-                foreach (TierItem it in BuildTierItems(cur))
-                {
-                    if (!it.HasPct)
-                    {
-                        continue;
-                    }
-                    double v;
-                    pct.TryGetValue(it.Model, out v);
-                    pct[it.Model] = v + it.Pct;
-                    approx[it.Model] = it.Approx;
-                }
-                return;
-            }
-            Dictionary<string, long[]> toks = new Dictionary<string, long[]>();
-            foreach (UsageTracker.ModelTotal mt in cur.ModelRows)
-            {
-                string key = BaseModel(mt.Model);
-                long[] tk;
-                if (!toks.TryGetValue(key, out tk))
-                {
-                    tk = new long[10];
-                    toks[key] = tk;
-                }
-                for (int i = 0; i < 10; i++)
-                {
-                    tk[i] += mt.Tok[i];
-                }
-            }
-            foreach (KeyValuePair<string, long[]> kv in toks)
-            {
-                double p;
-                bool a;
-                if (TryQuotaPct(kv.Key, kv.Value, false, out p, out a))
-                {
-                    pct[kv.Key] = p;
-                    approx[kv.Key] = a;
-                }
-            }
-        }
-
-        private string[] TierTotalNums(UsageTracker.PeriodSummary cur)
-        {
-            long msgs = 0, outp = 0, think = 0;
-            foreach (UsageTracker.TierTotal tt in cur.TierRows)
-            {
-                msgs += tt.Msgs;
-                outp += tt.Out;
-                think += tt.Think;
-            }
-            return new string[] { UsageTracker.FormatTokens(msgs), UsageTracker.FormatTokens(outp), UsageTracker.FormatTokens(think), TotalEstimateText(cur, false) };
-        }
-
-        // Tier view: one row per "model × tier". Tier = thinking effort (low / medium / high / xhigh / max); messages with Ultracode on count as ultra on their own;
-        // fast mode appends +fast; records without a tag are called "Unlabeled". Count = number of API messages; output includes thinking; 5h estimate = converted quota
-        private int DrawTierRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
-            float colW, float nameW, float y, float rowH, int cap)
-        {
-            LoadQuota();
-            List<TierItem> items = BuildTierItems(cur);
-            if (items.Count == 0)
-            {
-                DrawTextRect(g, "No usage in this period", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
-                return 1;
-            }
-            double sumPct = 0;
-            long sumTotal = 0;
-            foreach (TierItem it in items)
-            {
-                sumPct += it.Pct;
-                sumTotal += it.Total;
-            }
-            int shown = items.Count <= cap ? items.Count : cap - 1;
-            int drawn = 0;
-            for (int i = 0; i < shown; i++)
-            {
-                TierItem it = items[i];
-                float ry = y + drawn * rowH;
-                double share = sumPct > 0 ? it.Pct / sumPct : ShareOf(it.Total, sumTotal);
-                skin.DrawShare(g, pad + 6f * s, ry + 2.5f * s, share, curPal, s);
-                float nameX = pad + (skin.ShareWidth + 13f) * s;
-                DrawTextRect(g, it.Model.Replace("claude-", "") + " " + it.Tier, fSmall, TextMain,
-                    new RectangleF(nameX, ry, nameW - (nameX - pad), rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
-                {
-                    UsageTracker.FormatTokens(it.Msgs), UsageTracker.FormatTokens(it.Out), UsageTracker.FormatTokens(it.Think),
-                    it.HasPct ? FormatPct(it.Pct, it.Approx) : "—"
-                }, TextMain);
-                drawn++;
-            }
-            if (shown < items.Count)
-            {
-                long rm = 0, ro = 0, rt = 0;
-                for (int i = shown; i < items.Count; i++)
-                {
-                    rm += items[i].Msgs;
-                    ro += items[i].Out;
-                    rt += items[i].Think;
-                }
-                DrawTextRect(g, "And " + (items.Count - shown) + " more", fSmall, TextDim,
-                    new RectangleF(pad + 4f * s, y + drawn * rowH, nameW - 4f * s, rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, y + drawn * rowH, rowH,
-                    new string[] { UsageTracker.FormatTokens(rm), UsageTracker.FormatTokens(ro), UsageTracker.FormatTokens(rt), "" }, TextDim);
-                drawn++;
-            }
-            return drawn;
-        }
-
         // Rank of a tier (used for the tag style): low < medium < high < xhigh < max < ultra
         private static int TierRank(string tier)
         {
@@ -5782,6 +7500,36 @@ namespace Stilla
         private float MeasureW(Graphics g, string text)
         {
             return g.MeasureString(text, fSmall, 4096, StringFormat.GenericTypographic).Width;
+        }
+
+        // the width DrawString compares with the rectangle (MeasureW without the left and right padding); wider text is cut to "xxx..."
+        private float TextW(Graphics g, string text, Font font)
+        {
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+                return g.MeasureString(text, font, 100000, sf).Width;
+            }
+        }
+
+        // vertical column dividers, from the header down to bottom
+        private void DrawDividers(Graphics g, float bottom)
+        {
+            colBottom = bottom;
+            if (usageMode >= 3)
+            {
+                return;
+            }
+            using (Pen divPen = new Pen(Track))
+            {
+                for (int i = FirstEdge(); i < 7; i++)
+                {
+                    if (colOn[i] && colNext[i] >= 0)
+                    {
+                        g.DrawLine(divPen, colEdgeX[i], colTop, colEdgeX[i], bottom);
+                    }
+                }
+            }
         }
 
         // Small tier tag (right edge aligned to rightX), returns the left edge of the tag. low~high: dashed frame, pale text; xhigh: solid frame; max: filled; ultra: filled orange. Empty text = draw nothing
@@ -5880,13 +7628,13 @@ namespace Stilla
             return a.ToString(f, CultureInfo.InvariantCulture) + "–" + b.ToString(f, CultureInfo.InvariantCulture);
         }
 
-        // Model view: one row per session (▸ opens each model × tier it used). Tokens are real data; the "estimate" is converted quota, for reference only
+        // Model view: one row per session, the end of the row has the model and tier labels; click a row to open a detail popup (detailed data and switch records for each model x tier).
+        // Tokens are actual data; "Est." is a converted quota figure, for reference only
         private int DrawModelRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float y, float rowH, int cap)
         {
             LoadQuota();
-            chevHits.Clear();
-            List<ModelLine> items = BuildModelLines(cur);
+            List<ModelGroup> items = BuildModelGroups(cur);
             if (items.Count == 0)
             {
                 DrawTextRect(g, "No model usage in this period", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
@@ -5898,54 +7646,39 @@ namespace Stilla
             int drawn = 0;
             for (int i = rowStart; i < rowStart + rowShown; i++)
             {
-                ModelLine ln = items[i];
                 float ry = y + drawn * rowH;
-                if (ln.Part == null)
-                {
-                    DrawModelGroupRow(g, ln, cur, pad, inner, s, colW, nameW, ry, rowH);
-                }
-                else
-                {
-                    DrawModelPartRow(g, ln.Part, pad, inner, s, colW, nameW, ry, rowH);
-                }
-                sessionHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad, ry, inner, rowH), ln.Group.Session));
+                DrawModelGroupRow(g, items[i], cur, pad, inner, s, colW, nameW, ry, rowH);
+                sessionHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad, ry, inner, rowH), items[i].Session));
                 drawn++;
             }
             if (rowMore)
             {
                 long rest = 0;
-                int groupsLeft = 0;
                 for (int i = rowShown; i < items.Count; i++)
                 {
-                    if (items[i].Part == null)
-                    {
-                        rest += items[i].Group.Total;
-                        groupsLeft++;
-                    }
+                    rest += items[i].Total;
                 }
-                DrawMoreRow(g, "▾ " + (groupsLeft > 0 ? groupsLeft + " more" : (items.Count - rowShown) + " more rows"),
+                DrawMoreRow(g, "▾ " + (items.Count - rowShown) + " more",
                     new string[] { UsageTracker.FormatTokens(rest), "", "", "" }, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
                 drawn++;
             }
             else if (rowCollapse)
             {
-                DrawMoreRow(g, items.Count > rowShown ? "▴ Collapse · scroll to page" : "▴ Collapse", null, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
+                DrawMoreRow(g, items.Count > rowShown ? "▴ Collapse · scroll" : "▴ Collapse", null, pad, inner, s, colW, nameW, y + drawn * rowH, rowH);
                 drawn++;
             }
             return drawn;
         }
 
-        // Session row: [▸] small circle title ……… model [tier]. When narrow, drop the model name first, then shorten "xhigh→max" to "…→max"; the title keeps at least 70 base units
-        private void DrawModelGroupRow(Graphics g, ModelLine ln, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
+        // Session row: [▾] dot title ......... model [tier]. ▾ = the model or tier changed during this period; click to open the popup and see every segment. When narrow, the model name is dropped first, then "xhigh->max" is shortened to "...->max"
+        private void DrawModelGroupRow(Graphics g, ModelGroup grp, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float ry, float rowH)
         {
-            ModelGroup grp = ln.Group;
             if (grp.Parts.Count > 1)
             {
-                DrawTextRect(g, ln.Expanded ? "▾" : "▸", fSmall, Accent, new RectangleF(pad - 2f * s, ry, 13f * s, rowH), StringAlignment.Center);
-                chevHits.Add(new KeyValuePair<RectangleF, string>(new RectangleF(pad - 4f * s, ry, 26f * s, rowH), grp.Session));
+                DrawTextRect(g, "▾", fSmall, Accent, new RectangleF(pad - 2f * s, ry, 13f * s, rowH), StringAlignment.Center);
             }
-            skin.DrawShare(g, pad + 10f * s, ry + 2.5f * s, ShareOf(grp.Total, cur.Total), curPal, s);
+            skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, ShareOf(grp.Total, cur.Total), curPal, s);
             float nameX = pad + (skin.ShareWidth + 17f) * s;
             string modelText, tierText;
             int rank;
@@ -5972,135 +7705,336 @@ namespace Stilla
             }, TextMain);
         }
 
-        // Expanded sub-row: indented to the small circle, └ model period ……… [tier]; when it does not fit, drop the period first
-        private void DrawModelPartRow(Graphics g, UsageTracker.ModelTotal mt, float pad, float inner, float s,
-            float colW, float nameW, float ry, float rowH)
+        // ---------------------------------------------------------------- detail popup (click a session in the Model view)
+        private bool TierPct(string model, string tier, long[] tok, bool week, out double pct, out bool approx)
         {
-            float textX = pad + 24f * s;
-            DrawTextRect(g, "└", fSmall, TextDim, new RectangleF(pad + 10f * s, ry, 12f * s, rowH), StringAlignment.Center);
-            float right = pad + nameW - 6f * s;
-            float x = DrawTierBadge(g, mt.Tier == "Unlabeled" ? "" : mt.Tier, TierRank(mt.Tier), right, ry, rowH, s);
-            float avail = x - 6f * s - textX;
-            string model = ShortModel(mt.Model);
-            string full = model + "  " + SpanText(mt.FirstUtc, mt.LastUtc);
-            DrawTextRect(g, MeasureW(g, full) + 4f * s <= avail ? full : model, fSmall, TextDim,
-                new RectangleF(textX, ry, Math.Max(24f * s, avail), rowH), StringAlignment.Near);
-            DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+            if (!TryQuotaPct(model, tok, week, out pct, out approx))
             {
-                UsageTracker.FormatTokens(mt.Total), PartEstimate(mt, false), PartEstimate(mt, true), UsageTracker.FormatTokens(mt.CacheRead)
-            }, TextDim);
+                return false;
+            }
+            pct *= quota.TierFactor(tier, week);
+            return true;
         }
 
-        // Compare view: merge all sessions by model, to see how many tokens each model used and its share; "5h estimate" is the 5-hour quota percentage points it consumed in this period
-        // (converted to dollars at official prices, then multiplied by the quota percentage points per dollar; the coefficient is fitted from the quota snapshots by quota_fit.py);
-        // "Multiple" = its quota % per million tokens ÷ that of the cheapest of these models (how many times more quota it burns than the cheapest for the same number of tokens).
-        // "≈" = this model was never measured, estimated from official prices; "—" = no price for this model
+        private double? UsdOf(string model, long[] tok)
+        {
+            QuotaTable.Entry e;
+            if (quota != null && quota.Models.TryGetValue(BaseModel(model), out e))
+            {
+                return quota.CostUsdAt(e, tok, 1.0);
+            }
+            return null;
+        }
+
+        private static string UsdText(double v)
+        {
+            if (!Finite(v))
+            {
+                return "—";
+            }
+            return v >= 1000 ? "$" + (v / 1000).ToString("0.0", CultureInfo.InvariantCulture) + "k"
+                : v >= 100 ? "$" + v.ToString("0", CultureInfo.InvariantCulture) : "$" + v.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private DetailRow MakeDetailRow(string model, string tier, string span, long msgs, long[] tok, long think, bool sub)
+        {
+            DetailRow r = new DetailRow();
+            r.Tier = tier;
+            r.Rank = TierRank(tier);
+            r.Model = ShortModel(model) + (sub ? " (subagent)" : "");
+            r.Span = span;
+            r.Msgs = msgs;
+            r.In = tok[0] + tok[5];
+            r.Out = tok[1] + tok[6];
+            r.Think = think;
+            r.Cw = tok[2] + tok[3] + tok[7] + tok[8];
+            r.Cr = tok[4] + tok[9];
+            double p;
+            bool ap;
+            if (TierPct(model, tier, tok, false, out p, out ap))
+            {
+                r.Pct5 = FormatPct(p, ap);
+            }
+            if (TierPct(model, tier, tok, true, out p, out ap))
+            {
+                r.PctW = FormatPct(p, ap);
+            }
+            double? usd = UsdOf(model, tok);
+            if (usd.HasValue)
+            {
+                r.Usd = UsdText(usd.Value);
+            }
+            return r;
+        }
+
+        private static string SpanLocal(DateTime a, DateTime b)
+        {
+            string f = a.Date == b.Date && a.Date == DateTime.Today ? "HH:mm" : "MM-dd HH:mm";
+            return a.ToString(f, CultureInfo.InvariantCulture) + "–" + b.ToString(f, CultureInfo.InvariantCulture);
+        }
+
+        // Builds the detail popup of a session: on top a summary per model x tier (with a total), below it (when the tier / model changed) the switch records in time order
+        private DetailPopup MakeTierPopup(ModelGroup grp, UsageTracker.PeriodSummary cur, List<SessionRun> runs)
+        {
+            LoadQuota();
+            List<DetailRow> tiers = new List<DetailRow>();
+            DetailRow total = new DetailRow();
+            total.Bold = true;
+            total.Tier = "Total";
+            long[] sumTok = new long[10];
+            double s5 = 0, sw = 0, usdSum = 0;
+            bool any5 = false, anyW = false, ap5 = false, apW = false, anyUsd = false;
+            DateTime first = DateTime.MaxValue, last = DateTime.MinValue;
+            foreach (UsageTracker.ModelTotal mt in grp.Parts)
+            {
+                tiers.Add(MakeDetailRow(mt.Model, mt.Tier, SpanText(mt.FirstUtc, mt.LastUtc), mt.Msgs, mt.Tok, mt.Think, false));
+                double p;
+                bool ap;
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, false, out p, out ap))
+                {
+                    s5 += p;
+                    any5 = true;
+                    ap5 = ap5 || ap;
+                }
+                if (TierPct(mt.Model, mt.Tier, mt.Tok, true, out p, out ap))
+                {
+                    sw += p;
+                    anyW = true;
+                    apW = apW || ap;
+                }
+                double? usd = UsdOf(mt.Model, mt.Tok);
+                if (usd.HasValue)
+                {
+                    usdSum += usd.Value;
+                    anyUsd = true;
+                }
+                for (int i = 0; i < 10; i++)
+                {
+                    sumTok[i] += mt.Tok[i];
+                }
+                total.Msgs += mt.Msgs;
+                total.Think += mt.Think;
+                if (mt.FirstUtc < first)
+                {
+                    first = mt.FirstUtc;
+                }
+                if (mt.LastUtc > last)
+                {
+                    last = mt.LastUtc;
+                }
+            }
+            total.Span = SpanText(first, last);
+            total.In = sumTok[0] + sumTok[5];
+            total.Out = sumTok[1] + sumTok[6];
+            total.Cw = sumTok[2] + sumTok[3] + sumTok[7] + sumTok[8];
+            total.Cr = sumTok[4] + sumTok[9];
+            if (any5)
+            {
+                total.Pct5 = FormatPct(s5, ap5);
+            }
+            if (anyW)
+            {
+                total.PctW = FormatPct(sw, apW);
+            }
+            if (anyUsd)
+            {
+                total.Usd = UsdText(usdSum);
+            }
+            tiers.Add(total);
+
+            List<DetailRow> runRows = null;
+            int hidden = 0;
+            if (runs != null && runs.Count > 0 && grp.Parts.Count > 1)
+            {
+                List<SessionRun> mainRuns = new List<SessionRun>();
+                List<SessionRun> subRuns = new List<SessionRun>();
+                foreach (SessionRun r in runs)
+                {
+                    (r.Sub ? subRuns : mainRuns).Add(r);
+                }
+                const int maxRuns = 20;
+                if (mainRuns.Count > maxRuns)
+                {
+                    hidden = mainRuns.Count - maxRuns;
+                    mainRuns.RemoveRange(0, hidden);
+                }
+                runRows = new List<DetailRow>();
+                foreach (SessionRun r in mainRuns)
+                {
+                    runRows.Add(MakeDetailRow(r.Model, r.Tier, SpanLocal(r.First, r.Last), r.Msgs, r.Tok, r.Think, false));
+                }
+                foreach (SessionRun r in subRuns)
+                {
+                    runRows.Add(MakeDetailRow(r.Model, r.Tier, SpanLocal(r.First, r.Last), r.Msgs, r.Tok, r.Think, true));
+                }
+            }
+
+            PopupColors pc = new PopupColors();
+            pc.Bg = Color.FromArgb(255, Bg);
+            pc.Main = Color.FromArgb(255, TextMain);
+            pc.Dim = Color.FromArgb(255, TextDim);
+            pc.Track = Color.FromArgb(255, SkinDraw.Mix(Bg, TextDim, 0.35f));
+            pc.Border = Color.FromArgb(255, SkinDraw.Mix(Bg, TextDim, 0.6f));
+            pc.Amber = Color.FromArgb(255, Amber);
+            string session = grp.Session;
+            return new DetailPopup(SessionTitle(session), cur.Label + "  " + cur.Range, tiers, runRows, hidden, pc, skin.UiFamily, scale,
+                delegate { OpenDrill(session); });
+        }
+
+        // Click a session row: read this session's switch records in the background, then open the detail popup under the row when done (click the same row again = collapse; clicking elsewhere / Esc / x also collapses)
+        private void ShowTierPopup(string session, RectangleF rowRect)
+        {
+            bool same = tierPopup != null && !tierPopup.IsDisposed && tierPopupSession == session;
+            if (tierPopup != null && !tierPopup.IsDisposed)
+            {
+                tierPopup.Close();
+            }
+            tierPopup = null;
+            if (same)
+            {
+                tierPopupSession = "";
+                return;
+            }
+            UsageTracker.PeriodSummary cur = PeriodFor(usagePeriod);
+            ModelGroup grp = null;
+            foreach (ModelGroup x in BuildModelGroups(cur))
+            {
+                if (x.Session == session)
+                {
+                    grp = x;
+                    break;
+                }
+            }
+            if (grp == null)
+            {
+                return;
+            }
+            DateTime from = cur.From, to = cur.To;
+            string detail = logger.DetailPath;
+            Point below = PointToScreen(new Point((int)rowRect.X, (int)rowRect.Bottom));
+            int rowTop = PointToScreen(new Point((int)rowRect.X, (int)rowRect.Y)).Y;
+            tierPopupSession = session;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<SessionRun> runs = null;
+                try
+                {
+                    runs = LogSummary.ReadRuns(detail, session, from, to);
+                }
+                catch (Exception)
+                {
+                }
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        if (tierPopupSession != session)
+                        {
+                            return;
+                        }
+                        try
+                        {
+                            DetailPopup pop = MakeTierPopup(grp, cur, runs);
+                            Rectangle wa = Screen.FromControl(this).WorkingArea;
+                            int x = Math.Max(wa.Left, Math.Min(Left, wa.Right - pop.Width));
+                            int yTop = below.Y + 2;
+                            if (yTop + pop.Height > wa.Bottom)
+                            {
+                                yTop = Math.Max(wa.Top, rowTop - pop.Height - 2);
+                            }
+                            pop.Location = new Point(x, yTop);
+                            tierPopup = pop;
+                            pop.Show(this);
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }));
+                }
+                catch (Exception)
+                {
+                }
+            });
+        }
+
+        // Compare view (model x tier): one row per "model + tier", all sessions combined. Tokens are actual data; "5h est." is the converted quota percentage points;
+        // "Mult." = its quota % per million tokens / that of the cheapest row here (for the same number of tokens, how many times more quota it uses than the cheapest).
+        // "≈" = this model has not been measured, inferred from official prices; a dash = no price for this model. The size of the small dot is its share of the quota
         private int DrawCompareRows(Graphics g, UsageTracker.PeriodSummary cur, float pad, float inner, float s,
             float colW, float nameW, float y, float rowH, int cap)
         {
             LoadQuota();
-            Dictionary<string, long> byModel = new Dictionary<string, long>();
-            Dictionary<string, long[]> byTok = new Dictionary<string, long[]>();
-            long all = 0;
-            foreach (UsageTracker.ModelTotal mt in cur.ModelRows)
-            {
-                string key = BaseModel(mt.Model);
-                long sum;
-                byModel.TryGetValue(key, out sum);
-                byModel[key] = sum + mt.Total;
-                long[] tok;
-                if (!byTok.TryGetValue(key, out tok))
-                {
-                    tok = new long[10];
-                    byTok[key] = tok;
-                }
-                for (int i = 0; i < 10; i++)
-                {
-                    tok[i] += mt.Tok[i];
-                }
-                all += mt.Total;
-            }
-            if (byModel.Count == 0)
+            List<TierItem> items = BuildTierItems(cur);
+            if (items.Count == 0)
             {
                 DrawTextRect(g, "No model usage in this period", fSmall, TextDim, new RectangleF(pad, y, inner, rowH), StringAlignment.Near);
                 return 1;
             }
-            List<KeyValuePair<string, long>> items = new List<KeyValuePair<string, long>>(byModel);
-            items.Sort(delegate(KeyValuePair<string, long> a, KeyValuePair<string, long> b) { return b.Value.CompareTo(a.Value); });
-
-            // Quota % of 5 hours per million tokens; the cheapest counts as 1x
             double cheapest = 0;
             bool cheapestApprox = false;
-            Dictionary<string, double> pctBy = new Dictionary<string, double>();
-            Dictionary<string, bool> apprBy = new Dictionary<string, bool>();
-            PerModelPct(cur, pctBy, apprBy);
-            Dictionary<string, double> rate = new Dictionary<string, double>();
-            Dictionary<string, bool> rateApprox = new Dictionary<string, bool>();
-            foreach (KeyValuePair<string, long> kv in items)
+            Dictionary<TierItem, double> rate = new Dictionary<TierItem, double>();
+            double sumPct = 0;
+            long sumTotal = 0;
+            foreach (TierItem it in items)
             {
-                double pct;
-                if (kv.Value > 0 && pctBy.TryGetValue(kv.Key, out pct) && pct > 0)
+                sumTotal += it.Total;
+                if (it.HasPct)
                 {
-                    bool approx = apprBy[kv.Key];
-                    double r = pct / (kv.Value / 1000000.0);
-                    rate[kv.Key] = r;
-                    rateApprox[kv.Key] = approx;
+                    sumPct += it.Pct;
+                }
+                if (it.HasPct && it.Pct > 0 && it.Total > 0)
+                {
+                    double r = it.Pct / (it.Total / 1000000.0);
+                    rate[it] = r;
                     if (cheapest == 0 || r < cheapest)
                     {
                         cheapest = r;
-                        cheapestApprox = approx;
+                        cheapestApprox = it.Approx;
                     }
                 }
             }
-
-            // Share = the model's quota estimate as a fraction of all models' quota estimates (falls back to the token share only when there is no conversion)
-            double sumPct = 0;
-            foreach (KeyValuePair<string, double> kv in pctBy)
+            if (sortCol[2] >= 0)
             {
-                sumPct += kv.Value;
+                ApplyCompareSort(items, rate);
             }
             int shown = items.Count <= cap ? items.Count : cap - 1;
-            int drawn = 0;
             for (int i = 0; i < shown; i++)
             {
-                string model = items[i].Key;
-                long tokens = items[i].Value;
-                float ry = y + drawn * rowH;
-                double myPct;
-                bool byQuota = sumPct > 0 && pctBy.TryGetValue(model, out myPct);
-                myPct = byQuota ? pctBy[model] : 0;
-                skin.DrawShare(g, pad + 6f * s, ry + 2.5f * s, byQuota ? myPct / sumPct : ShareOf(items[i].Value, all), curPal, s);
-                float nameX = pad + (skin.ShareWidth + 13f) * s;
-                DrawTextRect(g, model.Replace("claude-", ""), fSmall, TextMain, new RectangleF(nameX, ry, nameW - (nameX - pad), rowH), StringAlignment.Near);
+                TierItem it = items[i];
+                float ry = y + i * rowH;
+                skin.DrawShare(g, pad + 10f * s, ry + (rowH - 11f * s) / 2f, sumPct > 0 ? Math.Min(1.0, it.Pct / sumPct) : ShareOf(it.Total, sumTotal), curPal, s);
+                float nameX = pad + (skin.ShareWidth + 17f) * s;
+                float right = pad + nameW - 6f * s;
+                float x = DrawTierBadge(g, it.Tier == "Unlabeled" ? "" : it.Tier, TierRank(it.Tier), right, ry, rowH, s);
+                DrawTextRect(g, ShortModel(it.Model), fSmall, TextMain, new RectangleF(nameX, ry, Math.Max(24f * s, x - 6f * s - nameX), rowH), StringAlignment.Near);
                 string multiple = "—";
                 double rt;
-                if (rate.TryGetValue(model, out rt) && cheapest > 0)
+                if (rate.TryGetValue(it, out rt) && cheapest > 0)
                 {
                     double m = rt / cheapest;
-                    multiple = ((rateApprox[model] || cheapestApprox) && m > 1.0001 ? "≈×" : "×")
+                    multiple = ((it.Approx || cheapestApprox) && m > 1.0001 ? "≈×" : "×")
                         + (m < 10 ? m.ToString("0.0", CultureInfo.InvariantCulture) : m.ToString("0", CultureInfo.InvariantCulture));
                 }
-                DrawRowNumbers(g, pad, inner, colW, ry, rowH, new string[]
+                DrawRowNumbers5(g, pad, inner, colW, ry, rowH, new string[]
                 {
-                    UsageTracker.FormatTokens(tokens), byQuota ? (myPct * 100.0 / sumPct).ToString("0.0", CultureInfo.InvariantCulture) + "%" : Share(tokens, all),
-                    pctBy.ContainsKey(model) ? FormatPct(pctBy[model], apprBy[model]) : "—", multiple
+                    UsageTracker.FormatTokens(it.Total), UsageTracker.FormatTokens(it.Out), UsageTracker.FormatTokens(it.Think),
+                    it.HasPct ? FormatPct(it.Pct, it.Approx) : "—", multiple
                 }, TextMain);
-                drawn++;
             }
             if (shown < items.Count)
             {
                 long rest = 0;
                 for (int i = shown; i < items.Count; i++)
                 {
-                    rest += items[i].Value;
+                    rest += items[i].Total;
                 }
-                DrawTextRect(g, "And " + (items.Count - shown) + " more", fSmall, TextDim,
-                    new RectangleF(pad + 4f * s, y + drawn * rowH, nameW - 4f * s, rowH), StringAlignment.Near);
-                DrawRowNumbers(g, pad, inner, colW, y + drawn * rowH, rowH,
-                    new string[] { UsageTracker.FormatTokens(rest), sumPct > 0 ? "" : Share(rest, all), "", "" }, TextDim);
-                drawn++;
+                float ry = y + shown * rowH;
+                tipRowsOther = true;
+                DrawTextRect(g, "And " + (items.Count - shown) + " more", fSmall, TextDim, new RectangleF(pad + 4f * s, ry, nameW - 4f * s, rowH), StringAlignment.Near);
+                DrawRowNumbers5(g, pad, inner, colW, ry, rowH, new string[] { UsageTracker.FormatTokens(rest), "", "", "", "" }, TextDim);
+                return shown + 1;
             }
-            return drawn;
+            return shown;
         }
 
         private static string Share(long part, long all)
@@ -6195,32 +8129,15 @@ namespace Stilla
             return Green;
         }
 
-        // Like DrawTextRect, but shrinks the font (down to 70%) before it falls back to an ellipsis
-        private void DrawTextFit(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align)
-        {
-            float need;
-            using (StringFormat sf = new StringFormat())
-            {
-                sf.FormatFlags = StringFormatFlags.NoWrap;
-                need = g.MeasureString(text, font, 100000, sf).Width;
-            }
-            if (need <= rect.Width || rect.Width <= 0f)
-            {
-                DrawTextRect(g, text, font, color, rect, align);
-                return;
-            }
-            using (Font small = new Font(font.FontFamily, font.Size * Math.Max(0.7f, rect.Width / need * 0.97f), font.Style, font.Unit))
-            {
-                DrawTextRect(g, text, small, color, rect, align);
-            }
-        }
-
         private void DrawTextRect(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align)
         {
             if (string.IsNullOrEmpty(text))
             {
                 return;
             }
+#if UICHECK
+            UiProbe.Text(g, text, font, rect, align);       // layout check: compiled only into tools/ui-check Harness, not in release builds
+#endif
             using (StringFormat sf = new StringFormat())
             {
                 sf.Alignment = align;
@@ -6243,6 +8160,31 @@ namespace Stilla
                 {
                     g.DrawString(text, font, b, rect, sf);
                 }
+            }
+        }
+
+        // like DrawTextRect, but text that is too wide first gets a smaller font (down to minK times the size) and only then an ellipsis
+        private void DrawTextFit(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align)
+        {
+            DrawTextFit(g, text, font, color, rect, align, 0.78f);
+        }
+
+        private void DrawTextFit(Graphics g, string text, Font font, Color color, RectangleF rect, StringAlignment align, float minK)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+            float need = TextW(g, text, font);
+            if (need <= rect.Width + 0.5f || rect.Width <= 1f)
+            {
+                DrawTextRect(g, text, font, color, rect, align);
+                return;
+            }
+            float k = Math.Max(minK, rect.Width / need * 0.985f);
+            using (Font small = new Font(font.FontFamily, font.Size * k, font.Style, font.Unit))
+            {
+                DrawTextRect(g, text, small, color, rect, align);
             }
         }
 
@@ -6276,9 +8218,22 @@ namespace Stilla
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (resizing || colDrag >= 0 || rowDrag)
+            {
+                TipReset();
+            }
+            else
+            {
+                TipMove(e.Location);        // Hover tips
+            }
             if (resizing)
             {
                 DoResize();
+                return;
+            }
+            if (rowDrag)
+            {
+                DoRowDrag(e.Y);
                 return;
             }
             if (colDrag >= 0)
@@ -6291,6 +8246,11 @@ namespace Stilla
                 Cursor = Cursors.SizeWE;
                 return;
             }
+            if (GripAt(e.Location))
+            {
+                Cursor = System.Windows.Forms.Cursors.SizeNS;
+                return;
+            }
             int edge = EdgeAt(e.Location);
             if (edge != 0)
             {
@@ -6298,7 +8258,7 @@ namespace Stilla
             }
             else
             {
-                Cursor = (closeRect.Contains(e.Location) || refreshRect.Contains(e.Location) || TabAt(e.Location) >= 0 || SegAt(e.Location) >= 0 || (showUsage && moreRect.Contains(e.Location)) || SessionAt(e.Location) != null || accountRect.Contains(e.Location) || toggleRect.Contains(e.Location) || (!badgeRect.IsEmpty && badgeRect.Contains(e.Location))) ? Cursors.Hand : Cursors.Default;
+                Cursor = (closeRect.Contains(e.Location) || refreshRect.Contains(e.Location) || TabAt(e.Location) >= 0 || SegAt(e.Location) >= 0 || (showUsage && moreRect.Contains(e.Location)) || SessionAt(e.Location) != null || accountRect.Contains(e.Location) || toggleRect.Contains(e.Location) || (!badgeRect.IsEmpty && badgeRect.Contains(e.Location)) || HeadAt(e.Location) >= 0 || JumpAt(e.Location) != null || TrendTabAt(e.Location) >= 0 || (showUsage && (healthRect.Contains(e.Location) || tabMoreRect.Contains(e.Location) || pauseRect.Contains(e.Location) || mailBtnRect.Contains(e.Location)))) ? Cursors.Hand : Cursors.Default;
             }
         }
 
@@ -6320,6 +8280,7 @@ namespace Stilla
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            TipClicked();
             if (e.Button != MouseButtons.Left)
             {
                 return;
@@ -6350,6 +8311,12 @@ namespace Stilla
                 SetUsageVisible(!showUsage);
                 return;
             }
+            // The "..." at the right end of the time tab strip: choose which time tabs to show, plus other quick settings
+            if (showUsage && tabMoreRect.Contains(e.Location))
+            {
+                ShowTabMenu();
+                return;
+            }
             // Click a time tab at the top of the usage panel to switch the display
             if (showUsage)
             {
@@ -6374,9 +8341,69 @@ namespace Stilla
             {
                 colDrag = divider;
                 colDragX0 = e.X;
-                Array.Copy(colFr, colDragStart, 6);
+                Array.Copy(colFr, colDragStart, 8);
                 Capture = true;
                 return;
+            }
+            // The divider above the 'Total' row: drag up / down to adjust the row spacing; double-click to restore the default
+            if (GripAt(e.Location))
+            {
+                if (e.Clicks >= 2)
+                {
+                    rowHu = RowHuDefault;
+                    Redraw();
+                    SaveSettings();
+                    return;
+                }
+                rowDrag = true;
+                rowDragY0 = e.Y;
+                rowDragH0 = rowHu;
+                rowDragN = Math.Max(1, gripRows);
+                Capture = true;
+                return;
+            }
+            // The 24 h / 7 d switch at the top right of the trend chart; the estimate self-check hint in the total row
+            if (showUsage && usageMode == 5)
+            {
+                int tt = TrendTabAt(e.Location);
+                if (tt >= 0)
+                {
+                    trendRange = tt;
+                    trendKey = "";
+                    Redraw();
+                    SaveSettings();
+                    return;
+                }
+            }
+            if (showUsage && pauseRect.Contains(e.Location))
+            {
+                TogglePause();
+                return;
+            }
+            if (showUsage && usageMode == 0 && mailBtnRect.Contains(e.Location))
+            {
+                OpenMailForm();
+                return;
+            }
+            if (showUsage && healthRect.Contains(e.Location))
+            {
+                ShowHealthDialog();
+                return;
+            }
+            // Click a header: the text of 'Speed' = choose the statistics window; anything else (including the small triangle on its right) = sort by this column
+            if (showUsage && usageMode <= 2)
+            {
+                if (usageMode == 0 && (speedHeadRect.Contains(e.Location) || occHeadRect.Contains(e.Location)))
+                {
+                    ShowSpeedMenu(speedHeadRect.Contains(e.Location) ? speedHeadRect : occHeadRect);      // 'Speed' and 'Share' use the same statistics window
+                    return;
+                }
+                int headCol = HeadAt(e.Location);
+                if (headCol >= 0)
+                {
+                    ToggleSort(headCol);
+                    return;
+                }
             }
             // Clicking the title in the panel header: cycles through session -> model -> compare
             if (showUsage && SegAt(e.Location) >= 0)
@@ -6387,22 +8414,8 @@ namespace Stilla
                 SaveSettings();
                 return;
             }
-            // In the model view, clicking the arrow at the start of a session row: expand or collapse the model x tier rows it used (takes priority over "click a session row to open details")
-            if (showUsage && usageMode == 1)
-            {
-                string chev = ChevronAt(e.Location);
-                if (chev != null)
-                {
-                    if (!expandedGroups.Remove(chev))
-                    {
-                        expandedGroups.Add(chev);
-                    }
-                    Redraw();
-                    return;
-                }
-            }
             // In the subscription view, clicking an account row: switch the statistics to this account (explains why when the login is bound to a different account)
-            if (showUsage && usageMode == 4)
+            if (showUsage && usageMode == 3)
             {
                 foreach (KeyValuePair<RectangleF, string> h in accountHits)
                 {
@@ -6419,11 +8432,35 @@ namespace Stilla
                 ToggleRows();
                 return;
             }
-            // Clicking a session row in the usage panel: open its details
+            // In the session view, clicking the ↗ right of the name: jump to the window of this session
+            if (showUsage && usageMode == 0)
+            {
+                UsageTracker.SessionTotal jt = JumpAt(e.Location);
+                if (jt != null)
+                {
+                    JumpToSession(jt);
+                    return;
+                }
+            }
+            // Click a session row in the usage panel: the model view pops up a small detail window (detailed data for each tier); the other views open its details
             string hitSession = SessionAt(e.Location);
             if (hitSession != null)
             {
-                OpenDrill(hitSession);
+                if (usageMode == 1)
+                {
+                    foreach (KeyValuePair<RectangleF, string> h in sessionHits)
+                    {
+                        if (h.Key.Contains(e.Location))
+                        {
+                            ShowTierPopup(hitSession, h.Key);
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    OpenDrill(hitSession);
+                }
                 return;
             }
             // Pressing on a window edge: drag to resize (the four sides and the four corners)
@@ -6446,7 +8483,20 @@ namespace Stilla
         // The usage statistics run on a background thread so that the first read of large history files does not freeze the UI; only one runs at a time
         private void RefreshUsage()
         {
-            if (!showUsage || Interlocked.CompareExchange(ref usageBusy, 1, 0) != 0)
+            if (paused)
+            {
+                return;
+            }
+            if (!showUsage)
+            {
+                // Panel closed: if cache reminders are on, slow down to one read every 15 seconds and keep tracking (only the newly appended end of the session records is read); if reminders are off too, nothing is read at all
+                if (!alertsOn || DateTime.UtcNow - lastBgUsageUtc < TimeSpan.FromSeconds(Cad().BgPollSec))
+                {
+                    return;
+                }
+                lastBgUsageUtc = DateTime.UtcNow;
+            }
+            if (Interlocked.CompareExchange(ref usageBusy, 1, 0) != 0)
             {
                 return;
             }
@@ -6496,8 +8546,8 @@ namespace Stilla
         }
 
         // Window size: follows the content by default; remembered once the user drags an edge (base units). The minimum size guarantees the content fits
-        private int MinW() { return showUsage ? 420 : 240; }
-        private int MinH() { return showUsage ? CompactH() + 196 : CompactH(); }
+        private int MinW() { return showUsage ? 520 : 240; }
+        private int MinH() { return showUsage ? CompactH() + 240 : CompactH(); }       // 240 = header and cups 146 + two rows + total, forecast and cost line + bottom margin
         private int CurW() { return Math.Max(MinW(), winWu > 0 ? winWu : ContentW()); }
         private int CurH() { return Math.Max(MinH(), winHu > 0 ? winHu : ContentH()); }
 
@@ -6570,6 +8620,12 @@ namespace Stilla
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (rowDrag)
+            {
+                rowDrag = false;
+                Capture = false;
+                SaveSettings();
+            }
             if (colDrag >= 0)
             {
                 colDrag = -1;
@@ -6591,6 +8647,9 @@ namespace Stilla
             tm.Items.Add("Show / hide", null, delegate { ToggleVisible(); });
             tm.Items.Add("Light / dark", null, delegate { ToggleInvert(); });
             tm.Items.Add("Refresh now", null, delegate { StartFetch(); });
+            ToolStripMenuItem trayPause = BuildPauseItem();
+            tm.Opening += delegate { trayPause.Checked = paused; };
+            tm.Items.Add(trayPause);
             tm.Items.Add("Settings...", null, delegate { OpenSettings(); });
             tm.Items.Add(new ToolStripSeparator());
             tm.Items.Add("Exit", null, delegate { exitRequested = true; Close(); });
@@ -6601,6 +8660,7 @@ namespace Stilla
             tray.DoubleClick += delegate { ToggleVisible(); };
             UpdateTrayText();
             tray.Visible = true;
+            InitExtras();
         }
 
         private void ToggleVisible()
@@ -6627,6 +8687,11 @@ namespace Stilla
             string week = data != null && data.SevenDay != null ? Math.Round(data.SevenDay.Percent).ToString("0", CultureInfo.InvariantCulture) + "%" : "—";
             Account acct = AccountStore.Current;
             string text = "Stilla " + (acct != null ? acct.Id + "·" + PlanInfo.ShortOf(acct.Plan) + " · " : "") + "5h " + five + " · Weekly " + week;
+            string counts = CountText();
+            if (counts.Length > 0)
+            {
+                text += " · " + counts;
+            }
             if (UpdateState.Available)
             {
                 text = "● " + text;
@@ -6642,18 +8707,6 @@ namespace Stilla
                 return null;
             }
             foreach (KeyValuePair<RectangleF, string> h in sessionHits)
-            {
-                if (h.Key.Contains(p))
-                {
-                    return h.Value;
-                }
-            }
-            return null;
-        }
-
-        private string ChevronAt(Point p)
-        {
-            foreach (KeyValuePair<RectangleF, string> h in chevHits)
             {
                 if (h.Key.Contains(p))
                 {
@@ -6698,13 +8751,13 @@ namespace Stilla
         // Which column divider the mouse is on (only valid inside the card's column area); -1 if none
         private int DividerAt(Point p)
         {
-            if (!showUsage || usageMode == 4 || p.Y < colTop || p.Y > colBottom)
+            if (!showUsage || usageMode >= 3 || p.Y < colTop || p.Y > colBottom)
             {
                 return -1;
             }
-            for (int i = usageMode == 0 ? 0 : 1; i < 5; i++)
+            for (int i = FirstEdge(); i < 7; i++)
             {
-                if (Math.Abs(p.X - colEdgeX[i]) <= Math.Max(4f, 4f * scale))
+                if (colOn[i] && colNext[i] >= 0 && Math.Abs(p.X - colEdgeX[i]) <= Math.Max(4f, 4f * scale))
                 {
                     return i;
                 }
@@ -6716,24 +8769,25 @@ namespace Stilla
         private void DoColumnDrag(int x)
         {
             int i = colDrag;
-            double total = colDragStart[i] + colDragStart[i + 1];
+            int j = colNext[i] >= 0 ? colNext[i] : i + 1;
+            double total = colDragStart[i] + colDragStart[j];
             double a = colDragStart[i] + (x - colDragX0) / (double)colInner;
             if (a < MinColFrac(i))
             {
                 a = MinColFrac(i);
             }
-            if (total - a < MinColFrac(i + 1))
+            if (total - a < MinColFrac(j))
             {
-                a = total - MinColFrac(i + 1);
+                a = total - MinColFrac(j);
             }
             colFr[i] = a;
-            colFr[i + 1] = total - a;
+            colFr[j] = total - a;
             Redraw();
         }
 
         private double MinColFrac(int col)
         {
-            float px = col == 0 ? 120f * scale : col == 1 ? 56f * scale : 44f * scale;
+            float px = col == 0 ? 120f * scale : col == 1 ? 64f * scale : col == 2 ? 70f * scale : col == 3 && usageMode == 0 ? 78f * scale : col == 7 && usageMode != 0 ? 56f * scale : 52f * scale;
             return colInner > 0 ? px / colInner : 0;
         }
 
@@ -6907,7 +8961,10 @@ namespace Stilla
                 rowsExpanded = false;
                 rowScroll = 0;
                 autoWinHu = 0;
-                usageSnap = new UsageTracker.Snapshot();
+                if (!alertsOn)
+                {
+                    usageSnap = new UsageTracker.Snapshot();
+                }
             }
             ApplyScale();
             KeepOnScreen();
@@ -6968,17 +9025,29 @@ namespace Stilla
             logItem.Click += delegate { logger.Enabled = logItem.Checked; SaveSettings(); };
             menu.Items.Add(logItem);
 
+            ToolStripMenuItem alertItem = new ToolStripMenuItem("Notify before the cache expires (reads sessions every 15 s even if the panel is closed)");
+            alertItem.CheckOnClick = true;
+            alertItem.Checked = alertsOn;
+            alertItem.Click += delegate
+            {
+                alertsOn = alertItem.Checked;
+                if (!alertsOn && !showUsage)
+                {
+                    usageSnap = new UsageTracker.Snapshot();
+                    indicatorKey = -1;
+                    UpdateCacheIndicators();
+                }
+                SaveSettings();
+            };
+            menu.Items.Add(alertItem);
+
             ToolStripMenuItem usageItem = usageMenuItem = new ToolStripMenuItem("Show usage statistics");
             usageItem.CheckOnClick = true;
             usageItem.Checked = showUsage;
             usageItem.Click += delegate { SetUsageVisible(usageItem.Checked); };
             menu.Items.Add(usageItem);
             menu.Items.Add("Time tab settings...", null, delegate { OpenTabSettings(); });
-            ToolStripMenuItem dsItem = new ToolStripMenuItem("Show DeepSeek estimate row");
-            dsItem.CheckOnClick = true;
-            dsItem.Checked = showDeepSeek;
-            dsItem.Click += delegate { showDeepSeek = dsItem.Checked; SaveSettings(); Redraw(); };
-            menu.Items.Add(dsItem);
+            AddFeatureMenu(menu);
             menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem acctMenu = new ToolStripMenuItem("Accounts and subscriptions");
@@ -7093,7 +9162,7 @@ namespace Stilla
                 // Show the tray balloon only once per new version
                 UpdateState.Notified = UpdateState.Latest;
                 UpdateState.Save();
-                Balloon("Stilla has a new version " + UpdateState.Latest, "Current " + AppInfo.Version + ". Right-click -> Settings... -> Go to update page; or click the red dot next to the Stilla mark.");
+                Balloon("Stilla has a new version " + UpdateState.Latest, "You have " + AppInfo.Version + ". Right-click → Settings... → Go to update page, or click the red dot next to the Stilla mark.");
             }
             if (settingsForm != null && !settingsForm.IsDisposed)
             {
@@ -7290,6 +9359,10 @@ namespace Stilla
             return AppPaths.SettingsFile;
         }
 
+        private const int SettingsVersion = 2;      // Version of settings.txt: written as sv=2 since 0.2; a file without sv comes from 0.1.x
+        private bool sawSv;
+        private bool legacyDs, sawDmask;             // The 0.1.x ds=1 (DeepSeek estimate row switched on) has to be carried over into the new "other display items" switch
+
         private void LoadSettings()
         {
             try
@@ -7313,15 +9386,27 @@ namespace Stilla
                     else if (k == "fg" && v >= FgMin && v <= 100) fgPercent = v;
                     else if (k == "top") TopMost = v != 0;
                     else if (k == "usage") showUsage = v != 0;
-                    else if (k == "w" && v > 0) winWu = v;
-                    else if (k == "h2" && v > 0) winHu = v;     // The layout changed in v16; the h saved by older versions is no longer used (otherwise the table would be squeezed into one row)
+                    else if (k == "sv") sawSv = true;
+                    else if (k == "w" && v > 0 && v <= 10000) winWu = v;
+                    else if (k == "h2" && v > 0 && v <= 10000) winHu = v;     // The layout changed in v16; the h saved by older versions is no longer used (otherwise the table would be squeezed into one row)
                     else if (k == "log") logger.Enabled = v != 0;
                     else if (k == "src" && v >= 0 && v <= 2) QuotaSource.Mode = v;
                     else if (k == "onl" && v >= 0 && v <= 2) QuotaSource.OnlineConsent = v;
-                    else if (k == "ds") showDeepSeek = v != 0;
                     else if (k == "upd") UpdateState.Auto = v != 0;
+                    else if (k == "alert") alertsOn = v != 0;
                     else if (k == "tabs" && v > 0 && v < (1 << TabCount)) tabMask = v;
-                    else if (k == "mode" && v >= 0 && v <= 4) usageMode = v;
+                    else if (k == "mode" && v >= 0 && v <= 5) legacyMode = v;       // View numbers of the old version (0 Session 1 Model 2 Compare 3 Tier 4 Plan 5 API)
+                    else if (k == "view" && v >= 0 && v <= 5)
+                    {
+                        usageMode = v;
+                        sawView = true;
+                    }
+                    else if (k == "speedwin" && v >= 1 && v <= 2880) speedMin = v;
+                    else if (k.Length == 5 && k.StartsWith("sort") && k[4] >= '0' && k[4] <= '2' && v >= 0 && v / 2 - 1 <= 7)
+                    {
+                        sortCol[k[4] - '0'] = v / 2 - 1;
+                        sortDesc[k[4] - '0'] = v % 2 == 1;
+                    }
                     else if (k == "skin" && v >= 0 && v < Skins.Length)
                     {
                         skinIndex = v;
@@ -7334,18 +9419,52 @@ namespace Stilla
                         ApplyPalette(skin, inverted);
                     }
                     else if (k == "modelview") usageMode = v != 0 ? 1 : 0;     // A setting from old versions: there were only session and model
+                    else if (k == "fmask") { fmask = v; sawFmask = true; }
+                    else if (k == "vmask") vmask = v;
+                    else if (k == "smask") smask = v;
+                    else if (k == "dmask") { dmask = v; sawDmask = true; }
+                    else if (k == "ds") legacyDs = v != 0;
+                    else if (k == "costscope" && (v == 0 || v == 1)) costScope = v;
+                    else if (k == "trendr" && (v == 0 || v == 1)) trendRange = v;
+                    else if (k == "tips" && (v == 0 || v == 1)) tipsOn = v == 1;
+                    else if (k == "rowh" && v >= RowHuMin && v <= RowHuMax) rowHu = v;
+                    else if (k == "colv") sawColv = true;
+                    else if (k == "alertmin" && v >= 1 && v <= 120) alertMin = v;
+                    else if (k == "limitwarn" && v >= 0 && v <= 100) limitWarn = v;
+                    else if (k == "tabpreset" && v > 0 && v < (1 << TabCount)) tabPreset = v;
+                    else if (k.Length == 4 && (k.StartsWith("crf") || k.StartsWith("crt")) && k[3] >= '0' && k[3] <= '4')
+                    {
+                        if (k[2] == 'f') crFrom[k[3] - '0'] = v; else crTo[k[3] - '0'] = v;
+                    }
                     else if (k == "cfrom") customFromMin = v;
                     else if (k == "cto") customToMin = v;
-                    else if (k.Length == 2 && k[0] == 'c' && k[1] >= '0' && k[1] <= '5' && v > 0) colFr[k[1] - '0'] = v / 1000.0;
+                    else if (k.Length == 3 && k[0] == 'c' && k[1] == 'c' && k[2] >= '0' && k[2] <= '7' && v > 0) colFr[k[2] - '0'] = v / 1000.0;
+                }
+                if (legacyDs && !sawDmask)
+                {
+                    dmask |= Feat.DsLine;       // The DeepSeek row was switched on in 0.1.x ("Show DeepSeek estimate row"): keep it on after the upgrade (the profile then shows as Custom)
+                }
+                if (!sawSv)
+                {
+                    // The window size saved by 0.1.x was chosen for the old panel (420 wide); the 0.2 panel is wider and the old size would squeeze out the new columns, so the default size is restored only on the first start after the upgrade
+                    winWu = 0;
+                    winHu = 0;
+                }
+                if (!sawView && legacyMode >= 0)
+                {
+                    int[] map = { 0, 1, 2, 2, 3, 4 };       // The old 'Tier' view was merged into 'Compare', so the Plan / API numbers moved up by one
+                    usageMode = map[legacyMode];
                 }
             }
             catch (Exception)
             {
             }
+            FinishSettingsLoad();
         }
 
         private void SaveSettings()
         {
+            SyncMasksFromFields();
             try
             {
                 string path = SettingsPath();
@@ -7357,24 +9476,46 @@ namespace Stilla
                     "bg=" + bgPercent,
                     "fg=" + fgPercent,
                     "top=" + (TopMost ? 1 : 0),
+                    "sv=" + SettingsVersion,
                     "usage=" + (showUsage ? 1 : 0),
                     "w=" + winWu,
                     "h2=" + (rowsExpanded && autoWinHu > 0 && winHu == autoWinHu ? savedWinHu : winHu),
                     "log=" + (logger.Enabled ? 1 : 0),
                     "src=" + QuotaSource.Mode,
                     "onl=" + QuotaSource.OnlineConsent,
-                    "ds=" + (showDeepSeek ? 1 : 0),
                     "upd=" + (UpdateState.Auto ? 1 : 0),
-                    "mode=" + usageMode,
+                    "alert=" + (alertsOn ? 1 : 0),
+                    "view=" + usageMode,
+                    "speedwin=" + speedMin,
+                    "sort0=" + (sortCol[0] < 0 ? 0 : (sortCol[0] + 1) * 2 + (sortDesc[0] ? 1 : 0)),
+                    "sort1=" + (sortCol[1] < 0 ? 0 : (sortCol[1] + 1) * 2 + (sortDesc[1] ? 1 : 0)),
+                    "sort2=" + (sortCol[2] < 0 ? 0 : (sortCol[2] + 1) * 2 + (sortDesc[2] ? 1 : 0)),
                     "dark=" + (inverted ? 1 : 0),
                     "skin=" + skinIndex,
                     "tabs=" + tabMask,
-                    "c0=" + (int)Math.Round(colFr[0] * 1000),
-                    "c1=" + (int)Math.Round(colFr[1] * 1000),
-                    "c2=" + (int)Math.Round(colFr[2] * 1000),
-                    "c3=" + (int)Math.Round(colFr[3] * 1000),
-                    "c4=" + (int)Math.Round(colFr[4] * 1000),
-                    "c5=" + (int)Math.Round(colFr[5] * 1000),
+                    "cc0=" + (int)Math.Round(colFr[0] * 1000),
+                    "cc1=" + (int)Math.Round(colFr[1] * 1000),
+                    "cc2=" + (int)Math.Round(colFr[2] * 1000),
+                    "cc3=" + (int)Math.Round(colFr[3] * 1000),
+                    "cc4=" + (int)Math.Round(colFr[4] * 1000),
+                    "cc5=" + (int)Math.Round(colFr[5] * 1000),
+                    "cc6=" + (int)Math.Round(colFr[6] * 1000),
+                    "cc7=" + (int)Math.Round(colFr[7] * 1000),
+                    "profile=" + profile,
+                    "fmask=" + fmask,
+                    "vmask=" + vmask,
+                    "smask=" + smask,
+                    "dmask=" + dmask,
+                    "costscope=" + costScope,
+                    "trendr=" + trendRange,
+                    "tips=" + (tipsOn ? 1 : 0),
+                    "rowh=" + rowHu,
+                    "colv=2",
+                    "alertmin=" + alertMin,
+                    "limitwarn=" + limitWarn,
+                    "tabpreset=" + tabPreset,
+                    "crf0=" + crFrom[0], "crf1=" + crFrom[1], "crf2=" + crFrom[2], "crf3=" + crFrom[3], "crf4=" + crFrom[4],
+                    "crt0=" + crTo[0], "crt1=" + crTo[1], "crt2=" + crTo[2], "crt3=" + crTo[3], "crt4=" + crTo[4],
                     "cfrom=" + customFromMin,
                     "cto=" + customToMin
                 });
@@ -7650,6 +9791,22 @@ namespace Stilla
 
                 EnableDpiAwareness();
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+                // An exception on the UI thread that nobody caught (something unexpected in a timer / painting): do not show .NET's "unhandled exception" dialog (the timer would trigger it again every 3 seconds), swallow it and redraw / retry on the next tick.
+                // To investigate problems set the environment variable STILLA_DEBUG=1; the cause is then written to error.log in the data folder
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs ev)
+                {
+                    if (Environment.GetEnvironmentVariable("STILLA_DEBUG") == "1")
+                    {
+                        try
+                        {
+                            File.AppendAllText(Path.Combine(AppPaths.Home, "error.log"), DateTime.Now.ToString("s") + " " + ev.Exception + "\r\n");
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+                };
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new Widget());

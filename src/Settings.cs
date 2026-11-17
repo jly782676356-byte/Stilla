@@ -27,6 +27,7 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(540, 478);
             try
             {

@@ -17,7 +17,11 @@ import random
 import sys
 import datetime as dt
 
-out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.getcwd(), 'demo')
+args = [a for a in sys.argv[1:] if not a.startswith('--')]
+flags = [a for a in sys.argv[1:] if a.startswith('--')]
+RICH = '--rich' in flags       # 版面检查用：再写一份价格表（额度换算.csv）、额度快照、几个账号；文件名和表里的词按 src 里的源码自动认（中文树 / 英文树都行）
+out = args[0] if args else os.path.join(os.getcwd(), 'demo')
+SRC = args[1] if len(args) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
 cfg = os.path.join(out, 'claude')
 home = os.path.join(out, 'home')
 logs = os.path.join(home, 'logs')
@@ -88,4 +92,74 @@ with open(os.path.join(logs, '账号.csv'), 'w', encoding='utf-8-sig', newline='
     f.write('编号,名称,计划,开始日期,月费,绑定组织,登录提示,备注\r\n')
     f.write('A,演示账号,max5,2026-10-01,100,org-demo,d***o@example.com,\r\n')
 
+
+def src_text():
+    buf = []
+    for fn in sorted(os.listdir(SRC)):
+        if fn.endswith('.cs'):
+            with open(os.path.join(SRC, fn), encoding='utf-8') as f:
+                buf.append(f.read())
+    return '\n'.join(buf)
+
+
+def rich():
+    """版面检查用的假数据：价格表、额度快照、几个账号。词和文件名从源码里读，所以中文树和英文树都能用。"""
+    import re
+    code = src_text()
+    m = re.search(r'Path\.Combine\(AppPaths\.DataDir, "([^"]+\.csv)"\), AccountStore\.CurrentKey', code)
+    quota_name = m.group(1) if m else 'quota_conversion.csv'
+    m = re.search(r'quotaPath = Path\.Combine\(logDir, "([^"]+)"\)', code)
+    snap_name = m.group(1) if m else 'quota_snapshots.csv'
+    m = re.search(r'accountsPath = Path\.Combine\(logDir, "([^"]+)"\)', code)
+    acct_name = m.group(1) if m else 'accounts.csv'
+    m = re.search(r'f\.Length < 13 \|\| f\[0\] == "([^"]+)"', code)
+    head_word = m.group(1) if m else 'Type'
+    m = re.search(r'if \(f\[0\] == "([^"]+)"\)\s*\{\s*t\.PlanDerived', code)
+    glob_word = m.group(1) if m else 'Global'
+    m = re.search(r't\.Stale && f\[0\] != "([^"]+)"', code)
+    model_word = m.group(1) if m else 'Model'
+    m = re.search(r'if \(f\[0\] == "([^"]+)"\)\s*\{\s*double d5', code)
+    tier_word = m.group(1) if m else 'Tier'
+    m = re.search(r'e\.Measured5 = f\[11\] == "([^"]+)"', code)
+    meas_word = m.group(1) if m else 'Measured'
+    print('rich data: quota=%s snap=%s acct=%s words=%s/%s/%s/%s/%s' % (quota_name, snap_name, acct_name, head_word, glob_word, model_word, tier_word, meas_word))
+
+    key = 'A:max5'
+    ts = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    price = {
+        'claude-opus-5-5': (5, 25, 6.25, 10, 0.5, 1.9, 0.30),
+        'claude-sonnet-5-5': (3, 15, 3.75, 6, 0.3, 1.2, 0.17),
+        'claude-haiku-5-5': (1, 5, 1.25, 2, 0.1, 0.5, 0.07),
+    }
+    head = 'Type,Name,Input,Output,Write5m,Write1h,Read,K5,Err5,KW,ErrW,State5,StateW,Updated,LongCtx,LongMult,ReadScale,Err,Blocks,Early,Ratio,Basis,Key'
+    rows = [head.replace('Type', head_word, 1)]
+    rows.append('%s,%s,,,,,,1.2,0.0021,0.17,0.0004,fit,fit,%s,,,1.0,0.0512,12,,0.97,week,%s' % (glob_word, glob_word, ts, key))
+    for name, p in price.items():
+        rows.append('%s,%s,%s,%.3f,0.0021,%.3f,0.0004,%s,%s,%s,,,,,,,,,%s' % (model_word, name, ','.join(str(x) for x in p[:5]), p[5], p[6], meas_word, meas_word, ts, key))
+    for tier, mult in (('low', 0.78), ('medium', 0.9), ('high', 1.0), ('xhigh', 1.22), ('max', 1.45)):
+        rows.append('%s,%s,,,,,,%.3f,0.01,%.3f,0.01,%s,%s,%s,,,,,,,,,%s' % (tier_word, tier, mult, mult, meas_word, meas_word, ts, key))
+    with open(os.path.join(logs, quota_name), 'w', encoding='utf-8', newline='') as f:
+        f.write('\n'.join(rows) + '\n')
+
+    # 额度快照：时间,5h%,5h重置,周%,周重置（最近 3 小时，每 10 分钟一条）
+    r5 = (dt.datetime.now() + dt.timedelta(minutes=71)).replace(second=0, microsecond=0)
+    rw = (dt.datetime.now() + dt.timedelta(hours=64)).replace(minute=0, second=0, microsecond=0)
+    lines = []
+    for i in range(18, -1, -1):
+        t = dt.datetime.now() - dt.timedelta(minutes=10 * i)
+        lines.append('%s,%.1f,%s,%.1f,%s' % (t.strftime('%Y-%m-%d %H:%M:%S'), 58 - i * 1.3, r5.strftime('%Y-%m-%d %H:%M:%S'),
+                                           61 - i * 0.2, rw.strftime('%Y-%m-%d %H:%M:%S')))
+    with open(os.path.join(logs, snap_name), 'w', encoding='utf-8', newline='') as f:
+        f.write('\n'.join(lines) + '\n')
+
+    # 三个假账号（订阅视图用）
+    with open(os.path.join(logs, acct_name), 'w', encoding='utf-8-sig', newline='') as f:
+        f.write('编号,名称,计划,开始日期,月费,绑定组织,登录提示,备注\r\n')
+        f.write('A,Demo A,max5,2026-10-01,100,org-demo,d***o@example.com,\r\n')
+        f.write('B,Demo B,pro,2026-09-12,20,org-b,b***o@example.com,\r\n')
+        f.write('C,Demo C,max20,2026-11-03,200,,,\r\n')
+
+
+if RICH:
+    rich()
 print('demo data written to', out)

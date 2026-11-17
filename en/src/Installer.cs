@@ -125,7 +125,7 @@ namespace Stilla
                 File.Copy(Application.ExecutablePath, setupCopy, true);
             }
 
-            log("Registering in \"Settings -> Apps\"...");
+            log("Registering in \"Settings → Apps\"...");
             using (RegistryKey k = Registry.CurrentUser.CreateSubKey(UninstallKey))
             {
                 k.SetValue("DisplayName", "Stilla");
@@ -364,7 +364,7 @@ namespace Stilla
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(560, 520);
+            ClientSize = new Size(560, 548);
             try
             {
                 Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -422,20 +422,20 @@ namespace Stilla
             sub.Text = "This will edit " + ClaudeSettings.PathIn(ClaudeRoots.Primary()) + ": a backup is made first, any status line you already have is kept, and it is undone on uninstall. You can leave it unticked and set it up later from Stilla's right-click menu.";
             sub.ForeColor = Color.DimGray;
             sub.Location = new Point(40, 236);
-            sub.Size = new Size(504, 34);
+            sub.Size = new Size(504, 52);
             Controls.Add(sub);
-            cLaunch = Check("Launch after installing", o.Launch, 276);
+            cLaunch = Check("Launch after installing", o.Launch, 294);
 
             Label l2 = new Label();
             l2.Text = "Detected Claude data folders (read-only, used to count session usage; the command line, VS Code and the desktop app are all searched):";
-            l2.Location = new Point(16, 308);
-            l2.Size = new Size(528, 20);
+            l2.Location = new Point(16, 326);
+            l2.Size = new Size(528, 34);
             Controls.Add(l2);
             TextBox roots = new TextBox();
             roots.Multiline = true;
             roots.ReadOnly = true;
             roots.ScrollBars = ScrollBars.Vertical;
-            roots.Location = new Point(16, 330);
+            roots.Location = new Point(16, 364);
             roots.Size = new Size(528, 56);
             StringBuilder sb = new StringBuilder();
             foreach (string r in ClaudeRoots.All())
@@ -449,20 +449,20 @@ namespace Stilla
             log.Multiline = true;
             log.ReadOnly = true;
             log.ScrollBars = ScrollBars.Vertical;
-            log.Location = new Point(16, 396);
+            log.Location = new Point(16, 428);
             log.Size = new Size(528, 66);
-            log.Text = "Can't see your folder? After installing, right-click -> Claude data folders -> Add folder.";
+            log.Text = "Can't see your folder? After installing, right-click → Claude data folders → Add folder.";
             Controls.Add(log);
 
             install = new Button();
             install.Text = "Install";
-            install.Location = new Point(376, 476);
+            install.Location = new Point(376, 502);
             install.Size = new Size(80, 30);
             install.Click += delegate { if (done) { Close(); } else { DoInstall(); } };
             Controls.Add(install);
             cancel = new Button();
             cancel.Text = "Cancel";
-            cancel.Location = new Point(464, 476);
+            cancel.Location = new Point(464, 502);
             cancel.Size = new Size(80, 30);
             cancel.Click += delegate { Close(); };
             Controls.Add(cancel);

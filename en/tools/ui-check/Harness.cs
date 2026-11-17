@@ -18,7 +18,7 @@ using System.Windows.Forms;
 
 namespace Stilla
 {
-    internal static class Harness
+    internal static partial class Harness
     {
         private const BindingFlags Inst = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
         private const BindingFlags Stat = BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public;
@@ -298,7 +298,7 @@ namespace Stilla
                 string[] names = { "Up to date", "New version", "Check failed", "Development build (repository not configured)" };
                 for (int v = 0; v < 4; v++)
                 {
-                    UpdateState.Latest = v == 1 ? "0.2.0" : "";
+                    UpdateState.Latest = v == 1 ? "9.9.9" : "";      // a fake newer version (must be higher than AppInfo.Version)
                     UpdateState.Last = v == 0 ? UpdateResult.UpToDate : v == 2 ? UpdateResult.Failed : UpdateResult.None;
                     UpdateState.Detail = v == 2 ? "network" : "";
                     UpdateState.CheckedUtc = v == 0 || v == 1 ? DateTime.UtcNow : DateTime.MinValue;
@@ -564,7 +564,7 @@ namespace Stilla
                     int hBack = (int)Call("CurH");
                     bool menuOn = ((ToolStripMenuItem)Get("usageMenuItem")).Checked;
 
-                    bool ok = simple && full && menuOff && menuOn && samePlace && hSimple == hBar && hBack == hFull && hFull - hSimple == 288;
+                    bool ok = simple && full && menuOff && menuOn && samePlace && hSimple == hBar && hBack == hFull && hFull - hSimple == (int)wt.GetField("UsagePanelH", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public).GetRawConstantValue();
                     Console.WriteLine((ok ? "PASS  " : "FAIL  ") + tag + "  detailed " + hFull + " -> simple " + hSimple + " -> detailed " + hBack
                         + (samePlace ? "" : "  (button moved)") + (menuOff && menuOn ? "" : "  (menu check out of sync)"));
                     if (!ok) bad++;
@@ -573,6 +573,10 @@ namespace Stilla
                 Console.WriteLine("toggle check: " + (bad == 0 ? "all " + n + " skins OK" : bad + " skins FAILED"));
                 w.Dispose();
                 return bad == 0 ? 0 : 1;
+            }
+            else if (scenario.StartsWith("q_", StringComparison.Ordinal))
+            {
+                return RunQa(scenario, outDir);     // QaScenarios.cs / QaDialogs.cs: layout QA of the 0.2.0 usage panel
             }
             else
             {

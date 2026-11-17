@@ -80,7 +80,9 @@ TIER = {
 TAU = 0.5            # Prior: how far each model's "quota per dollar" may differ from the overall average (relative; 0.5 = usually not more than half off)
 QUANT_SD = 0.29      # Standard deviation of the rounding error of integer percentages (uniform distribution); a lower reference bound for the fit residual
 HUBER_C = 1.5
-MIN_POINTS = 40      # Do not write a result if fewer points than this take part in the fit
+MIN_POINTS = 40      # Fewer fit points than this: write no result (one block is kept back for validation and tier correction)
+MIN_FIT_POINTS = 30  # A basis needs at least this many points for its 5-hour coefficient; with fewer it is derived from another basis by the plan multiplier
+MIN_FIT_R2 = 0.9     # Goodness of fit (within-group R2) below this is not used: the data most likely spans a plan / account change, so no result is better than a wrong one
 FOLD_HOURS = 2.0     # Leave-one-out validation: cut the curve into 2-hour blocks and predict each block's increment with coefficients fitted on the other blocks
 MIN_FOLD_DELTA = 3   # Validation only looks at blocks with an increment >= 3 percentage points (smaller blocks drown in rounding error)
 LAGS = [-120, -60, 0, 60, 120, 180, 300]
@@ -725,8 +727,11 @@ def analyse5(snaps, msgs, lines, by_mode=None):
 
     pts, seginfo = build_points(msgs, segs, models, best_lag, best_rho, 'cost')
     f = fit(pts, nmod, TAU)
-    if f is None or f['n'] < MIN_POINTS:
+    if f is None or f['n'] < MIN_FIT_POINTS:
         lines.append('Too few points (%d), no result.' % (0 if f is None else f['n']))
+        return None
+    if f['r2'] < MIN_FIT_R2:
+        lines.append('Goodness of fit too low (R2=%.3f, %d points): the data for this basis most likely spans a plan / account change, so no result is written.' % (f['r2'], f['n']))
         return None
 
     # Current basis: per-segment slopes -> if the basis changed use only the latest segment, otherwise weight by precision and recency

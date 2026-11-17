@@ -17,7 +17,7 @@ namespace Stilla
     internal static class AppInfo
     {
         public const string Name = "Stilla";
-        public const string Version = "0.1.1";
+        public const string Version = "0.2.0";
         public const string Disclaimer = "Stilla 是独立的社区项目，不是 Anthropic 出品，也没有得到 Anthropic 的认可。Claude 是 Anthropic, PBC 的商标。";
 
         // 项目的 GitHub 仓库：「检查更新」「前往更新页面」「捐赠」都指向这里。
@@ -419,7 +419,8 @@ namespace Stilla
             string d = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
             if (string.IsNullOrEmpty(d))
             {
-                d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+                // 演示 / 隔离模式没指定 CLAUDE_CONFIG_DIR：不去碰真实的 ~\.claude，指到数据文件夹里一个不存在的子文件夹（读出来就是空的）
+                d = Isolated ? Path.Combine(AppPaths.Home, "claude-isolated") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
             }
             return d;
         }

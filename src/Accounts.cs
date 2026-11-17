@@ -257,6 +257,10 @@ namespace Stilla
         {
             LoginInfo li = new LoginInfo();
             string envDir = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+            if (string.IsNullOrEmpty(envDir) && ClaudeRoots.Isolated)
+            {
+                envDir = ClaudeRoots.Primary();     // 演示 / 隔离模式：不读真实的 ~\.claude.json
+            }
             string cfgJson = string.IsNullOrEmpty(envDir)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude.json")
                 : Path.Combine(envDir, ".claude.json");
@@ -612,6 +616,13 @@ namespace Stilla
         // 从现在起归到某个账号 / 计划。和最后一条一样就不记。返回是否真的记了
         public static bool SetCurrent(string accountId, string plan, string source)
         {
+            return SetCurrent(accountId, plan, source, null);
+        }
+
+        // snapshotPath 不为空时（自动识别用）：登录文件里的计划 / 账号往往比真正切换晚才更新（这次晚了一个多小时），
+        // 所以去额度快照里找「额度读数突然归零」的那一刻，把切换时间记到那一刻，系数才会跟着真实的账号 / 计划走
+        public static bool SetCurrent(string accountId, string plan, string source, string snapshotPath)
+        {
             lock (gate)
             {
                 TimelineEntry last = timeline.Count == 0 ? null : timeline[timeline.Count - 1];
@@ -625,10 +636,105 @@ namespace Stilla
                 e.AccountId = accountId;
                 e.Plan = plan;
                 e.Source = source;
+                if (snapshotPath != null && last != null)
+                {
+                    DateTime? at = FindCounterReset(snapshotPath, last.Utc);
+                    if (at.HasValue && at.Value > last.Utc && at.Value < e.Utc)
+                    {
+                        e.Utc = at.Value;
+                        e.Source = source + "（按额度读数归零校正）";
+                    }
+                }
                 timeline.Add(e);
             }
             SaveTimeline();
             return true;
+        }
+
+        // 在额度快照.csv 最近 12 小时里找最后一次「读数在窗口没结束时突然归零」：5 小时读数掉了 ≥ 10 个点，或每周读数掉了 ≥ 2 个点，
+        // 而上一行记的重置时间还在后面——这只会是换了套餐 / 换了账号（正常的窗口到期不算，那时重置时间已经过了）。
+        // 返回那一行的时间（UTC），要晚于 afterUtc；没有就返回 null
+        public static DateTime? FindCounterReset(string path, DateTime afterUtc)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
+                string text;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long take = Math.Min(fs.Length, 256 * 1024);
+                    fs.Seek(fs.Length - take, SeekOrigin.Begin);
+                    byte[] buf = new byte[take];
+                    int got = 0;
+                    while (got < buf.Length)
+                    {
+                        int n = fs.Read(buf, got, buf.Length - got);
+                        if (n <= 0)
+                        {
+                            break;
+                        }
+                        got += n;
+                    }
+                    text = Encoding.UTF8.GetString(buf, 0, got);
+                }
+                DateTime nowUtc = DateTime.UtcNow;
+                DateTime? found = null;
+                bool havePrev = false;
+                double prev5 = 0, prevW = 0;
+                DateTime prevReset5 = DateTime.MinValue, prevResetW = DateTime.MinValue;
+                foreach (string line in text.Split('\n'))
+                {
+                    string[] f = line.TrimEnd('\r').Split(',');
+                    DateTime t;
+                    if (f.Length < 5 || !DateTime.TryParseExact(f[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    {
+                        continue;
+                    }
+                    double p5 = -1, pw = -1;
+                    DateTime r5 = DateTime.MinValue, rw = DateTime.MinValue;
+                    double v;
+                    if (double.TryParse(f[1], NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                    {
+                        p5 = v;
+                    }
+                    if (double.TryParse(f[3], NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                    {
+                        pw = v;
+                    }
+                    DateTime.TryParseExact(f[2], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out r5);
+                    DateTime.TryParseExact(f[4], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out rw);
+                    if (havePrev)
+                    {
+                        DateTime guard = t.AddMinutes(2);
+                        bool drop5 = prev5 >= 0 && p5 >= 0 && prev5 - p5 >= 10 && prevReset5 > guard;
+                        bool dropW = prevW >= 0 && pw >= 0 && prevW - pw >= 2 && prevResetW > guard;
+                        if (drop5 || dropW)
+                        {
+                            DateTime u = DateTime.SpecifyKind(t, DateTimeKind.Local).ToUniversalTime();
+                            if (u > afterUtc && nowUtc - u < TimeSpan.FromHours(12))
+                            {
+                                found = u;
+                            }
+                        }
+                    }
+                    if (p5 >= 0 || pw >= 0)
+                    {
+                        havePrev = true;
+                        prev5 = p5;
+                        prevW = pw;
+                        prevReset5 = r5;
+                        prevResetW = rw;
+                    }
+                }
+                return found;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         public static void ReplaceTimeline(List<TimelineEntry> list)
@@ -911,6 +1017,7 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(660, 420);
 
             list.Location = new Point(12, 12);
@@ -1217,6 +1324,7 @@ namespace Stilla
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Microsoft YaHei UI", 9f);
+            DialogDpi.Apply(this);
             ClientSize = new Size(560, 400);
 
             Label tip = new Label();
